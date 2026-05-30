@@ -1,0 +1,251 @@
+// Package knn holds the reference vectors and runs a k-nearest-neighbors search
+// to score transactions. Vectors are quantized to uint8 so the full 3M-row
+// dataset fits comfortably in the per-instance memory budget.
+//
+// Three search strategies share the same quantized storage and the same K-NN
+// result contract (Score). They are selected via Build:
+//   - brute: scan every row (exact; the original, used for small N / fallback).
+//   - vptree: metric-tree exact search (same neighbors as brute, fewer visits).
+//   - ivf: inverted-file approximate search (k-means cells; fastest, ~recall<1).
+package knn
+
+import (
+	"math"
+
+	"rinha-fraud/internal/vectorize"
+)
+
+// K is the number of nearest neighbors used to score a transaction.
+const K = 5
+
+// Threshold: a transaction is approved when fraud_score < Threshold.
+const Threshold = 0.6
+
+// buildThreshold: below this many rows, Score always brute-forces regardless of
+// the configured mode. Keeps small indices (unit tests use 5..100 rows) exact
+// and avoids building a tree/clusters over a handful of points.
+const buildThreshold = 2048
+
+// quantize maps a normalized dimension to a uint8 bucket.
+//
+//	-1 (sentinel, no last_transaction) -> 0
+//	[0, 1]                             -> [1, 255]
+//
+// The sentinel gets its own bucket below the value range, so transactions
+// without history naturally cluster together (matching the dataset convention).
+func quantize(v float64) uint8 {
+	if v < 0 {
+		return 0
+	}
+	if v > 1 {
+		v = 1
+	}
+	return uint8(math.Round(v*254)) + 1
+}
+
+type searchMode uint8
+
+const (
+	modeBrute searchMode = iota
+	modeVPTree
+	modeIVF
+)
+
+// BuildConfig selects and parameterizes the search structure built by Build.
+type BuildConfig struct {
+	Mode   string // "brute" | "vptree" | "ivf" (anything else => brute)
+	NList  int    // IVF: number of k-means cells
+	NProbe int    // IVF: cells visited per query
+	Iters  int    // IVF: k-means iterations
+}
+
+// Index holds quantized reference vectors (flat, row-major) and a fraud bitset.
+// After Add-ing all rows, call Build to construct an accelerator; Score then
+// dispatches to it. Until Build is called (or for tiny N) Score is brute-force.
+type Index struct {
+	data []uint8  // n * vectorize.Dims quantized values
+	bits []uint64 // fraud bitset, one bit per row (1 = fraud)
+	n    int
+
+	mode searchMode
+	vp   *vpTree
+	ivf  *ivfIndex
+}
+
+// NewIndex pre-allocates storage for capacityHint rows.
+func NewIndex(capacityHint int) *Index {
+	if capacityHint < 0 {
+		capacityHint = 0
+	}
+	return &Index{
+		data: make([]uint8, 0, capacityHint*vectorize.Dims),
+		bits: make([]uint64, 0, (capacityHint+63)/64),
+	}
+}
+
+// Add quantizes vec and appends it with its fraud label.
+func (ix *Index) Add(vec [vectorize.Dims]float64, fraud bool) {
+	for i := 0; i < vectorize.Dims; i++ {
+		ix.data = append(ix.data, quantize(vec[i]))
+	}
+	word := ix.n >> 6
+	for len(ix.bits) <= word {
+		ix.bits = append(ix.bits, 0)
+	}
+	if fraud {
+		ix.bits[word] |= 1 << uint(ix.n&63)
+	}
+	ix.n++
+}
+
+// Len reports how many reference vectors are stored.
+func (ix *Index) Len() int { return ix.n }
+
+func (ix *Index) isFraud(i int) bool {
+	return ix.bits[i>>6]&(1<<uint(i&63)) != 0
+}
+
+// Build constructs the search accelerator selected by cfg. Must be called after
+// all rows are Add-ed and before concurrent Score calls. For n < buildThreshold
+// it forces brute-force (keeps small indices exact). Safe to call once.
+func (ix *Index) Build(cfg BuildConfig) {
+	if ix.n < buildThreshold {
+		ix.mode = modeBrute
+		return
+	}
+	switch cfg.Mode {
+	case "vptree":
+		ix.vp = buildVPTree(ix)
+		ix.mode = modeVPTree
+	case "ivf":
+		ix.ivf = buildIVF(ix, cfg)
+		ix.mode = modeIVF
+	default: // "brute", "" or unknown
+		ix.mode = modeBrute
+	}
+}
+
+// SetNProbe overrides how many IVF cells each query scans. No-op unless the
+// index is IVF and np > 0. Clamped to [1, nlist] and maxProbe. Lets a baked
+// (pre-built) index be retuned at startup without rebuilding.
+func (ix *Index) SetNProbe(np int) {
+	if ix.ivf == nil || np <= 0 {
+		return
+	}
+	if np > ix.ivf.nlist {
+		np = ix.ivf.nlist
+	}
+	if np > maxProbe {
+		np = maxProbe
+	}
+	ix.ivf.nprobe = np
+}
+
+// dist2 returns the squared euclidean distance between query q and row `row`.
+// Squared distance preserves nearest-neighbor ordering, so no sqrt is needed for
+// ranking; the VP-tree converts to true distance only where the triangle
+// inequality requires it.
+func (ix *Index) dist2(q *[vectorize.Dims]uint8, row int) uint32 {
+	off := row * vectorize.Dims
+	data := ix.data
+	var dist uint32
+	for d := 0; d < vectorize.Dims; d++ {
+		diff := int32(q[d]) - int32(data[off+d])
+		dist += uint32(diff * diff)
+	}
+	return dist
+}
+
+// rowDist2 is dist2 between two stored rows (used while building the VP-tree).
+func (ix *Index) rowDist2(a, b int) uint32 {
+	oa, ob := a*vectorize.Dims, b*vectorize.Dims
+	data := ix.data
+	var dist uint32
+	for d := 0; d < vectorize.Dims; d++ {
+		diff := int32(data[oa+d]) - int32(data[ob+d])
+		dist += uint32(diff * diff)
+	}
+	return dist
+}
+
+// topK is a tiny sorted buffer (ascending distance) of the K nearest seen so far.
+// Shared by every search strategy so they all produce the identical fraud score
+// given the same set of visited rows.
+type topK struct {
+	dist  [K]uint32
+	fraud [K]bool
+}
+
+func newTopK() topK {
+	var t topK
+	for i := range t.dist {
+		t.dist[i] = math.MaxUint32
+	}
+	return t
+}
+
+// worst is the distance of the current K-th nearest (the pruning bound).
+func (t *topK) worst() uint32 { return t.dist[K-1] }
+
+// consider inserts (dist, fraud) into the buffer if it beats the current K-th.
+func (t *topK) consider(dist uint32, fraud bool) {
+	if dist >= t.dist[K-1] {
+		return
+	}
+	pos := K - 1
+	for pos > 0 && t.dist[pos-1] > dist {
+		t.dist[pos] = t.dist[pos-1]
+		t.fraud[pos] = t.fraud[pos-1]
+		pos--
+	}
+	t.dist[pos] = dist
+	t.fraud[pos] = fraud
+}
+
+func (t *topK) fraudScore() float64 {
+	fraudCount := 0
+	for i := 0; i < K; i++ {
+		if t.fraud[i] {
+			fraudCount++
+		}
+	}
+	return float64(fraudCount) / float64(K)
+}
+
+// Score returns the fraud fraction among the K nearest reference vectors. It
+// quantizes the query and dispatches to the configured search strategy.
+func (ix *Index) Score(query [vectorize.Dims]float64) float64 {
+	if ix.n == 0 {
+		return 0
+	}
+
+	var q [vectorize.Dims]uint8
+	for i := 0; i < vectorize.Dims; i++ {
+		q[i] = quantize(query[i])
+	}
+
+	switch ix.mode {
+	case modeVPTree:
+		return ix.vp.search(ix, &q)
+	case modeIVF:
+		return ix.ivf.search(ix, &q)
+	default:
+		return ix.bruteScore(&q)
+	}
+}
+
+// bruteScore scans every row — exact, O(n). The fallback and the small-N path.
+func (ix *Index) bruteScore(q *[vectorize.Dims]uint8) float64 {
+	tk := ix.bruteTopK(q)
+	return tk.fraudScore()
+}
+
+// bruteTopK is the exact K nearest by full scan (used by bruteScore and by the
+// VP-tree/IVF correctness tests as the source of truth).
+func (ix *Index) bruteTopK(q *[vectorize.Dims]uint8) topK {
+	tk := newTopK()
+	for idx := 0; idx < ix.n; idx++ {
+		tk.consider(ix.dist2(q, idx), ix.isFraud(idx))
+	}
+	return tk
+}
