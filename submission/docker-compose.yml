@@ -1,0 +1,60 @@
+name: rinha-fraud
+
+# ============================================================================
+# docker-compose.yml da BRANCH `submission`.
+#
+# Regras (docs/br/ARQUITETURA.md + SUBMISSAO.md):
+#   - SEM `build:` aqui — a branch submission NÃO pode ter código-fonte.
+#   - A imagem precisa estar PUBLICAMENTE disponível (Docker Hub / ghcr).
+#   - Soma dos limites de TODOS os serviços <= 1 CPU e 350 MB.
+#
+# >>> TROQUE `srwalkerb/rinha-fraud:1.0` pela SUA imagem pública (publish.ps1). <<<
+# A imagem já carrega o index.bin (índice IVF pré-construído) — sobe sem dataset.
+# ============================================================================
+
+x-api: &api
+  image: srwalkerb/rinha-fraud:1.0
+  environment:
+    ADDR: ":8080"
+    GOMAXPROCS: "1"
+    GOMEMLIMIT: "150MiB"
+    # GC só dispara perto do limite de memória (live set ~54MB << 150MiB).
+    GOGC: "off"
+    # Células IVF varridas por query. Retuna o índice pré-construído SEM rebuild
+    # (maior = mais recall, mais lento). Medido: nprobe=12 -> p99 ~484ms.
+    KNN_NPROBE: "12"
+  networks:
+    - app
+  deploy:
+    resources:
+      limits:
+        cpus: "0.45"
+        memory: "155MB"
+
+services:
+  api1:
+    <<: *api
+
+  api2:
+    <<: *api
+
+  nginx:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "9999:9999"
+    depends_on:
+      - api1
+      - api2
+    networks:
+      - app
+    deploy:
+      resources:
+        limits:
+          cpus: "0.10"
+          memory: "40MB"
+
+networks:
+  app:
+    driver: bridge

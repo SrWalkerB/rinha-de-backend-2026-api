@@ -20,11 +20,10 @@ vendor/
 go.work
 go.work.sum
 
-# ---- Projeto: binários compilados ----
-rinha-fraud
-rinha-fraud.exe
-buildindex
-buildindex.exe
+# ---- Projeto: binários compilados (ancorados na raiz; *.exe já cobre Windows) ----
+# Sem a barra inicial, "buildindex" casaria também o diretório-fonte cmd/buildindex/.
+/rinha-fraud
+/buildindex
 
 # Índice de busca pré-construído (regenerado por cmd/buildindex / Docker build)
 resources/index.bin
