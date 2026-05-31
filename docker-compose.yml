@@ -1,24 +1,27 @@
 name: rinha-fraud
 
+# ============================================================================
+# docker-compose.yml da BRANCH `submission`.
+#
+# Regras (docs/br/ARQUITETURA.md + SUBMISSAO.md):
+#   - SEM `build:` aqui — a branch submission NÃO pode ter código-fonte.
+#   - A imagem precisa estar PUBLICAMENTE disponível (Docker Hub / ghcr).
+#   - Soma dos limites de TODOS os serviços <= 1 CPU e 350 MB.
+#
+# >>> TROQUE `srwalkerb/rinha-fraud:1.0` pela SUA imagem pública (publish.ps1). <<<
+# A imagem já carrega o index.bin (índice IVF pré-construído) — sobe sem dataset.
+# ============================================================================
+
 x-api: &api
-  image: rinha-fraud:local
-  build:
-    context: .
-    args:
-      # nlist baked into index.bin at build time (passo 05). Maior = células
-      # menores = query mais rápida (p99 menor); build offline aguenta.
-      KNN_NLIST: "4096"
-      KNN_KMEANS_ITERS: "8"
+  image: srwalkerb/rinha-fraud:1.0
   environment:
     ADDR: ":8080"
     GOMAXPROCS: "1"
     GOMEMLIMIT: "150MiB"
-    # GC só dispara perto do limite de memória (live set ~54MB << 150MiB), então
-    # gasta-se quase nada de CPU em GC sob carga. Ver passo 04.
+    # GC só dispara perto do limite de memória (live set ~54MB << 150MiB).
     GOGC: "off"
-    # Índice pré-construído em /app/index.bin (INDEX_PATH vem do Dockerfile).
-    # KNN_NPROBE retuna o índice no startup, SEM rebuild: nº de células varridas
-    # por query (maior = mais recall, mais lento). Ver passo 03/05.
+    # Células IVF varridas por query. Retuna o índice pré-construído SEM rebuild
+    # (maior = mais recall, mais lento). Medido: nprobe=12 -> p99 ~484ms.
     KNN_NPROBE: "12"
   networks:
     - app
