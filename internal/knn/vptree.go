@@ -28,7 +28,7 @@ type vpNode struct {
 
 type vpPair struct {
 	id int32
-	d2 uint32
+	d2 uint64
 }
 
 type vpBuilder struct {
@@ -92,18 +92,18 @@ func (b *vpBuilder) build(lo, hi int) int32 {
 	return ni
 }
 
-func (t *vpTree) search(ix *Index, q *[vectorize.Dims]uint8) float64 {
+func (t *vpTree) search(ix *Index, q *[vectorize.Dims]uint16) float64 {
 	tk := t.searchTopK(ix, q)
 	return tk.fraudScore()
 }
 
-func (t *vpTree) searchTopK(ix *Index, q *[vectorize.Dims]uint8) topK {
+func (t *vpTree) searchTopK(ix *Index, q *[vectorize.Dims]uint16) topK {
 	tk := newTopK()
 	t.searchNode(ix, q, t.root, &tk)
 	return tk
 }
 
-func (t *vpTree) searchNode(ix *Index, q *[vectorize.Dims]uint8, ni int32, tk *topK) {
+func (t *vpTree) searchNode(ix *Index, q *[vectorize.Dims]uint16, ni int32, tk *topK) {
 	if ni < 0 {
 		return
 	}

@@ -25,6 +25,7 @@ o `final_score` pro positivo — entendendo cada passo.
 | [04](04-tuning-runtime.md) | Tuning de runtime | `GOMAXPROCS`, `GOGC=off`, `GOMEMLIMIT`, rebalance de CPU | ✅ |
 | [05](05-preprocessamento-no-build.md) | Pré-processo no build | Construir o índice no Docker build (startup rápido, nlist grande) | ✅ (p99 1202→484ms, +395) |
 | [06](06-simd-avancado.md) | SIMD (avançado) | Vetorizar o cálculo de distância | 📋 guia (opcional, `GOAMD64=v3` não ligado) |
+| [07](07-diagnostico-failures.md) | Diagnóstico das failures | Harness offline; failures = quantização (não IVF!); fix uint16 | ✅ (det +1216→+1430) |
 
 Template para criar/seguir cada doc: [`_template.md`](_template.md).
 
@@ -45,12 +46,15 @@ direto do `results.json` gerado pelo `run-test.ps1`.
 | 04 | + nprobe=8, cpu 0.45/nginx 0.10 | 2026-05-30 | 1515ms | 0.63% | -180 | +959 | **+778** | +4529 | docker-9999 | p99 saiu do corte; nota POSITIVA; 45 timeouts |
 | 04 | + nprobe=6, GOGC=off | 2026-05-30 | 1202ms | 0.51% | -80 | +1217 | **+1136** | +358 | docker-9999 | **Err: 0** — 100% das requests atendidas (40.300, zero timeout) |
 | 05 | índice no build, nlist=4096 nprobe=12 | 2026-05-30 | 484ms | 0.50% | +315 | +1216 | **+1531** | +395 | docker-9999 | startup 25ms (era ~85s); **p99 1202→484ms**; Err=0; o 0.5% é FP+FN (classificação), não timeout |
+| 07 | quantização **uint16** (era uint8) | 2026-05-31 | 387ms | 0.33% | +413 | +1430 | **+1843** | +312 | docker-9999 | diagnóstico provou: failures eram QUANTIZAÇÃO, não IVF. uint16 → det +1216→**+1430** (portável). p99 não piorou (banda 2× irrelevante; IVF varre poucas linhas) |
 
-**Estado atual: `+1531`** (de -6000). Objetivo "0 timeout / 100% atendido" ✅. O passo 05 (índice
-pré-construído, `nlist=4096`, `nprobe=12`) cortou o `p99` de 1202ms pra **484ms** — o ganho de +395
-veio todo do `p99_score` (-80 → +315). Startup caiu de ~85s pra **25ms**. O `failure_rate: 0.5%`
-restante é **erro de classificação** (FP=147 + FN=119), não falha HTTP (`Err=0`, 100% servido) —
-30× abaixo do corte de 15%. Próximo `p99` viria de `nlist` ainda maior (8192) ou SIMD (passo 06).
+**Estado atual (local): `+1843`** (rank oficial no Mac Mini foi 1460 com uint8). Objetivo "0
+timeout / 100% atendido" ✅ (`Err=0` desde o passo 04). A jornada: p99 caiu de 2002ms→**387ms**
+(passos 03-05) e as failures de classificação de 0.5%→**0.33%** (passo 07, uint16). O ganho do
+passo 07 é o **`detection_score` +1216→+1430**, que é **portável** (independe de hardware) — então
+vale igual no Mac Mini. As failures restantes (0.33%) são FP+FN de fronteira; o piso de precisão
+do uint16 é ~144 (doc 07). Próximo salto de verdade (rumo a 0 failures + p99 sub-ms) = **classificador
+treinado** (doc 07, veredito final).
 
 ## Como medir (atalho)
 

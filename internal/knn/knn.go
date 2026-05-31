@@ -1,6 +1,8 @@
 // Package knn holds the reference vectors and runs a k-nearest-neighbors search
-// to score transactions. Vectors are quantized to uint8 so the full 3M-row
-// dataset fits comfortably in the per-instance memory budget.
+// to score transactions. Vectors are quantized to uint16 so the full 3M-row
+// dataset fits in the per-instance memory budget (~84MB) while keeping enough
+// precision that exact search matches the float64 ground truth (uint8's 255
+// buckets flipped ~0.4% of near-boundary cases; see docs/performance/07).
 //
 // Three search strategies share the same quantized storage and the same K-NN
 // result contract (Score). They are selected via Build:
@@ -26,21 +28,23 @@ const Threshold = 0.6
 // and avoids building a tree/clusters over a handful of points.
 const buildThreshold = 2048
 
-// quantize maps a normalized dimension to a uint8 bucket.
+// quantize maps a normalized dimension to a uint16 bucket.
 //
 //	-1 (sentinel, no last_transaction) -> 0
-//	[0, 1]                             -> [1, 255]
+//	[0, 1]                             -> [1, 65535]
 //
 // The sentinel gets its own bucket below the value range, so transactions
 // without history naturally cluster together (matching the dataset convention).
-func quantize(v float64) uint8 {
+// 65535 buckets keep distances close enough to float64 that exact search
+// reproduces the ground-truth 5-NN (uint8's 255 buckets did not — doc 07).
+func quantize(v float64) uint16 {
 	if v < 0 {
 		return 0
 	}
 	if v > 1 {
 		v = 1
 	}
-	return uint8(math.Round(v*254)) + 1
+	return uint16(math.Round(v*65534)) + 1
 }
 
 type searchMode uint8
@@ -63,7 +67,7 @@ type BuildConfig struct {
 // After Add-ing all rows, call Build to construct an accelerator; Score then
 // dispatches to it. Until Build is called (or for tiny N) Score is brute-force.
 type Index struct {
-	data []uint8  // n * vectorize.Dims quantized values
+	data []uint16 // n * vectorize.Dims quantized values
 	bits []uint64 // fraud bitset, one bit per row (1 = fraud)
 	n    int
 
@@ -78,7 +82,7 @@ func NewIndex(capacityHint int) *Index {
 		capacityHint = 0
 	}
 	return &Index{
-		data: make([]uint8, 0, capacityHint*vectorize.Dims),
+		data: make([]uint16, 0, capacityHint*vectorize.Dims),
 		bits: make([]uint64, 0, (capacityHint+63)/64),
 	}
 }
@@ -145,25 +149,25 @@ func (ix *Index) SetNProbe(np int) {
 // Squared distance preserves nearest-neighbor ordering, so no sqrt is needed for
 // ranking; the VP-tree converts to true distance only where the triangle
 // inequality requires it.
-func (ix *Index) dist2(q *[vectorize.Dims]uint8, row int) uint32 {
+func (ix *Index) dist2(q *[vectorize.Dims]uint16, row int) uint64 {
 	off := row * vectorize.Dims
 	data := ix.data
-	var dist uint32
+	var dist uint64
 	for d := 0; d < vectorize.Dims; d++ {
-		diff := int32(q[d]) - int32(data[off+d])
-		dist += uint32(diff * diff)
+		diff := int64(q[d]) - int64(data[off+d])
+		dist += uint64(diff * diff)
 	}
 	return dist
 }
 
 // rowDist2 is dist2 between two stored rows (used while building the VP-tree).
-func (ix *Index) rowDist2(a, b int) uint32 {
+func (ix *Index) rowDist2(a, b int) uint64 {
 	oa, ob := a*vectorize.Dims, b*vectorize.Dims
 	data := ix.data
-	var dist uint32
+	var dist uint64
 	for d := 0; d < vectorize.Dims; d++ {
-		diff := int32(data[oa+d]) - int32(data[ob+d])
-		dist += uint32(diff * diff)
+		diff := int64(data[oa+d]) - int64(data[ob+d])
+		dist += uint64(diff * diff)
 	}
 	return dist
 }
@@ -172,23 +176,23 @@ func (ix *Index) rowDist2(a, b int) uint32 {
 // Shared by every search strategy so they all produce the identical fraud score
 // given the same set of visited rows.
 type topK struct {
-	dist  [K]uint32
+	dist  [K]uint64
 	fraud [K]bool
 }
 
 func newTopK() topK {
 	var t topK
 	for i := range t.dist {
-		t.dist[i] = math.MaxUint32
+		t.dist[i] = math.MaxUint64
 	}
 	return t
 }
 
 // worst is the distance of the current K-th nearest (the pruning bound).
-func (t *topK) worst() uint32 { return t.dist[K-1] }
+func (t *topK) worst() uint64 { return t.dist[K-1] }
 
 // consider inserts (dist, fraud) into the buffer if it beats the current K-th.
-func (t *topK) consider(dist uint32, fraud bool) {
+func (t *topK) consider(dist uint64, fraud bool) {
 	if dist >= t.dist[K-1] {
 		return
 	}
@@ -219,7 +223,7 @@ func (ix *Index) Score(query [vectorize.Dims]float64) float64 {
 		return 0
 	}
 
-	var q [vectorize.Dims]uint8
+	var q [vectorize.Dims]uint16
 	for i := 0; i < vectorize.Dims; i++ {
 		q[i] = quantize(query[i])
 	}
@@ -235,14 +239,14 @@ func (ix *Index) Score(query [vectorize.Dims]float64) float64 {
 }
 
 // bruteScore scans every row — exact, O(n). The fallback and the small-N path.
-func (ix *Index) bruteScore(q *[vectorize.Dims]uint8) float64 {
+func (ix *Index) bruteScore(q *[vectorize.Dims]uint16) float64 {
 	tk := ix.bruteTopK(q)
 	return tk.fraudScore()
 }
 
 // bruteTopK is the exact K nearest by full scan (used by bruteScore and by the
 // VP-tree/IVF correctness tests as the source of truth).
-func (ix *Index) bruteTopK(q *[vectorize.Dims]uint8) topK {
+func (ix *Index) bruteTopK(q *[vectorize.Dims]uint16) topK {
 	tk := newTopK()
 	for idx := 0; idx < ix.n; idx++ {
 		tk.consider(ix.dist2(q, idx), ix.isFraud(idx))

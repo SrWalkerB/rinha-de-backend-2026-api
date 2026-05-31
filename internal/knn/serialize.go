@@ -25,7 +25,7 @@ import (
 
 const (
 	indexMagic   uint32 = 0x52464958 // "RFIX"
-	indexVersion uint32 = 1
+	indexVersion uint32 = 2          // v2: data/centroids are uint16 (was uint8 in v1)
 )
 
 // Save writes the built index to path. Only IVF and brute modes are
@@ -67,7 +67,7 @@ func (ix *Index) writeTo(w io.Writer) error {
 	if err := writeU64(w, uint64(ix.n)); err != nil {
 		return err
 	}
-	if err := writeBytes(w, ix.data); err != nil {
+	if err := writeU16Slice(w, ix.data); err != nil {
 		return err
 	}
 	if err := writeU64Slice(w, ix.bits); err != nil {
@@ -101,7 +101,7 @@ func readFrom(r io.Reader) (*Index, error) {
 	if err != nil {
 		return nil, err
 	}
-	data, err := readBytes(r)
+	data, err := readU16Slice(r)
 	if err != nil {
 		return nil, err
 	}
@@ -128,7 +128,7 @@ func (f *ivfIndex) writeTo(w io.Writer) error {
 	if err := writeU32(w, uint32(f.nprobe)); err != nil {
 		return err
 	}
-	if err := writeBytes(w, f.centroids); err != nil {
+	if err := writeU16Slice(w, f.centroids); err != nil {
 		return err
 	}
 
@@ -159,7 +159,7 @@ func readIVF(r io.Reader) (*ivfIndex, error) {
 	if err != nil {
 		return nil, err
 	}
-	centroids, err := readBytes(r)
+	centroids, err := readU16Slice(r)
 	if err != nil {
 		return nil, err
 	}
@@ -209,12 +209,15 @@ func writeU64(w io.Writer, v uint64) error {
 	return err
 }
 
-// writeBytes writes a length-prefixed raw byte slice.
-func writeBytes(w io.Writer, b []byte) error {
-	if err := writeU64(w, uint64(len(b))); err != nil {
+func writeU16Slice(w io.Writer, s []uint16) error {
+	if err := writeU64(w, uint64(len(s))); err != nil {
 		return err
 	}
-	_, err := w.Write(b)
+	buf := make([]byte, len(s)*2)
+	for i, v := range s {
+		binary.LittleEndian.PutUint16(buf[i*2:], v)
+	}
+	_, err := w.Write(buf)
 	return err
 }
 
@@ -272,16 +275,20 @@ func readU64(r io.Reader) (uint64, error) {
 	return binary.LittleEndian.Uint64(b[:]), nil
 }
 
-func readBytes(r io.Reader) ([]byte, error) {
+func readU16Slice(r io.Reader) ([]uint16, error) {
 	n, err := readU64(r)
 	if err != nil {
 		return nil, err
 	}
-	b := make([]byte, int(n))
-	if _, err := io.ReadFull(r, b); err != nil {
+	buf := make([]byte, int(n)*2)
+	if _, err := io.ReadFull(r, buf); err != nil {
 		return nil, err
 	}
-	return b, nil
+	s := make([]uint16, int(n))
+	for i := range s {
+		s[i] = binary.LittleEndian.Uint16(buf[i*2:])
+	}
+	return s, nil
 }
 
 func readU32Slice(r io.Reader) ([]uint32, error) {

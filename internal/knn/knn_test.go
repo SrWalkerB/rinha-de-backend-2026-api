@@ -15,7 +15,7 @@ func mkvec(base float64) [vectorize.Dims]float64 {
 	return v
 }
 
-// quantize pins the uint8 mapping: -1 sentinel -> 0, [0,1] -> [1,255], monotonic.
+// quantize pins the uint16 mapping: -1 sentinel -> 0, [0,1] -> [1,65535], monotonic.
 func TestQuantizeMapping(t *testing.T) {
 	if got := quantize(-1); got != 0 {
 		t.Errorf("quantize(-1) = %d, want 0", got)
@@ -23,8 +23,8 @@ func TestQuantizeMapping(t *testing.T) {
 	if got := quantize(0); got != 1 {
 		t.Errorf("quantize(0) = %d, want 1", got)
 	}
-	if got := quantize(1); got != 255 {
-		t.Errorf("quantize(1) = %d, want 255", got)
+	if got := quantize(1); got != 65535 {
+		t.Errorf("quantize(1) = %d, want 65535", got)
 	}
 	if quantize(0.5) <= quantize(0.25) {
 		t.Errorf("quantize not monotonic: q(0.5)=%d q(0.25)=%d", quantize(0.5), quantize(0.25))

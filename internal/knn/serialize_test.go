@@ -1,9 +1,9 @@
 package knn
 
 import (
-	"bytes"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
@@ -34,14 +34,14 @@ func TestIVFRoundTrip(t *testing.T) {
 	if got.mode != orig.mode {
 		t.Fatalf("mode %d != %d", got.mode, orig.mode)
 	}
-	if !bytes.Equal(got.data, orig.data) {
+	if !slices.Equal(got.data, orig.data) {
 		t.Fatalf("data differs after round-trip")
 	}
 	if got.ivf.nlist != orig.ivf.nlist || got.ivf.nprobe != orig.ivf.nprobe {
 		t.Fatalf("ivf params differ: got (%d,%d) want (%d,%d)",
 			got.ivf.nlist, got.ivf.nprobe, orig.ivf.nlist, orig.ivf.nprobe)
 	}
-	if !bytes.Equal(got.ivf.centroids, orig.ivf.centroids) {
+	if !slices.Equal(got.ivf.centroids, orig.ivf.centroids) {
 		t.Fatalf("centroids differ after round-trip")
 	}
 

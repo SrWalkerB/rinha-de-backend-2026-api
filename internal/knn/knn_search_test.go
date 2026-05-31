@@ -44,8 +44,8 @@ func randomQueries(n int, seed int64) [][vectorize.Dims]float64 {
 	return qs
 }
 
-func quantizeQuery(q [vectorize.Dims]float64) [vectorize.Dims]uint8 {
-	var out [vectorize.Dims]uint8
+func quantizeQuery(q [vectorize.Dims]float64) [vectorize.Dims]uint16 {
+	var out [vectorize.Dims]uint16
 	for i := range out {
 		out[i] = quantize(q[i])
 	}
