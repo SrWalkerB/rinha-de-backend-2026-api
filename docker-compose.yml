@@ -13,7 +13,7 @@ name: rinha-fraud
 # ============================================================================
 
 x-api: &api
-  image: srwalkerb/rinha-fraud:1.0
+  image: srwalkerb/rinha-fraud:1.1
   environment:
     ADDR: ":8080"
     GOMAXPROCS: "1"
