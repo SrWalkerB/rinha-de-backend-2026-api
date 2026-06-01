@@ -12,7 +12,7 @@ COPY go.mod ./
 COPY main.go ./
 COPY internal/ ./internal/
 COPY cmd/ ./cmd/
-COPY resources/normalization.json resources/mcc_risk.json ./resources/
+COPY resources/normalization.json resources/mcc_risk.json resources/model.json ./resources/
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go build -trimpath -ldflags="-s -w" -o /out/rinha-fraud . && \
     CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \

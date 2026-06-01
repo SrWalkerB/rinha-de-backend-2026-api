@@ -28,15 +28,17 @@ const Threshold = 0.6
 // and avoids building a tree/clusters over a handful of points.
 const buildThreshold = 2048
 
-// quantize maps a normalized dimension to a uint16 bucket.
+// quantize maps a normalized dimension to a uint16 bucket on the data's native
+// grid. The reference vectors are exactly 4-decimal, so round(v*10000) stores
+// them losslessly; dequant then reproduces the parsed float64 bit-for-bit.
 //
 //	-1 (sentinel, no last_transaction) -> 0
-//	[0, 1]                             -> [1, 65535]
+//	[0, 1]                             -> [1, 10001]
 //
-// The sentinel gets its own bucket below the value range, so transactions
-// without history naturally cluster together (matching the dataset convention).
-// 65535 buckets keep distances close enough to float64 that exact search
-// reproduces the ground-truth 5-NN (uint8's 255 buckets did not — doc 07).
+// Distance is computed in float64 (see dist2) against the un-quantized query,
+// so an exact (brute) search reproduces the float64 ground-truth 5-NN with no
+// quantization flips. The ~144 flips under the old ×65534 scale came from
+// quantizing the full-precision query — not the reference buckets (docs 07/08).
 func quantize(v float64) uint16 {
 	if v < 0 {
 		return 0
@@ -44,7 +46,29 @@ func quantize(v float64) uint16 {
 	if v > 1 {
 		v = 1
 	}
-	return uint16(math.Round(v*65534)) + 1
+	return uint16(math.Round(v*10000)) + 1
+}
+
+// maxBucket is the largest stored bucket: quantize(1) = round(1*10000)+1.
+const maxBucket = 10001
+
+// dequantTab maps a stored bucket to its exact float64 value, precomputed once
+// so the hot distance loop does a table lookup instead of a per-element division
+// (the /10000 division dominated p99 — see docs/performance/08). Bucket 0 is the
+// sentinel -1; buckets [1,10001] map to k/10000 (the exact ground-truth value,
+// bit-identical to what dividing would produce).
+var dequantTab = func() [maxBucket + 1]float64 {
+	var t [maxBucket + 1]float64
+	t[0] = -1
+	for u := 1; u <= maxBucket; u++ {
+		t[u] = float64(u-1) / 10000
+	}
+	return t
+}()
+
+// dequant reverses quantize via the precomputed table.
+func dequant(u uint16) float64 {
+	return dequantTab[u]
 }
 
 type searchMode uint8
@@ -145,29 +169,32 @@ func (ix *Index) SetNProbe(np int) {
 	ix.ivf.nprobe = np
 }
 
-// dist2 returns the squared euclidean distance between query q and row `row`.
+// dist2 returns the squared euclidean distance between the un-quantized query q
+// and stored row `row`. The stored uint16 ref is dequantized to its exact
+// 4-decimal float64, so the result matches the float64 ground-truth distance.
 // Squared distance preserves nearest-neighbor ordering, so no sqrt is needed for
 // ranking; the VP-tree converts to true distance only where the triangle
 // inequality requires it.
-func (ix *Index) dist2(q *[vectorize.Dims]uint16, row int) uint64 {
+func (ix *Index) dist2(q *[vectorize.Dims]float64, row int) float64 {
 	off := row * vectorize.Dims
 	data := ix.data
-	var dist uint64
+	var dist float64
 	for d := 0; d < vectorize.Dims; d++ {
-		diff := int64(q[d]) - int64(data[off+d])
-		dist += uint64(diff * diff)
+		diff := q[d] - dequant(data[off+d])
+		dist += diff * diff
 	}
 	return dist
 }
 
-// rowDist2 is dist2 between two stored rows (used while building the VP-tree).
-func (ix *Index) rowDist2(a, b int) uint64 {
+// rowDist2 is the squared distance between two stored rows (used while building
+// the VP-tree). Both rows are dequantized to float64.
+func (ix *Index) rowDist2(a, b int) float64 {
 	oa, ob := a*vectorize.Dims, b*vectorize.Dims
 	data := ix.data
-	var dist uint64
+	var dist float64
 	for d := 0; d < vectorize.Dims; d++ {
-		diff := int64(data[oa+d]) - int64(data[ob+d])
-		dist += uint64(diff * diff)
+		diff := dequant(data[oa+d]) - dequant(data[ob+d])
+		dist += diff * diff
 	}
 	return dist
 }
@@ -176,23 +203,23 @@ func (ix *Index) rowDist2(a, b int) uint64 {
 // Shared by every search strategy so they all produce the identical fraud score
 // given the same set of visited rows.
 type topK struct {
-	dist  [K]uint64
+	dist  [K]float64
 	fraud [K]bool
 }
 
 func newTopK() topK {
 	var t topK
 	for i := range t.dist {
-		t.dist[i] = math.MaxUint64
+		t.dist[i] = math.MaxFloat64
 	}
 	return t
 }
 
 // worst is the distance of the current K-th nearest (the pruning bound).
-func (t *topK) worst() uint64 { return t.dist[K-1] }
+func (t *topK) worst() float64 { return t.dist[K-1] }
 
 // consider inserts (dist, fraud) into the buffer if it beats the current K-th.
-func (t *topK) consider(dist uint64, fraud bool) {
+func (t *topK) consider(dist float64, fraud bool) {
 	if dist >= t.dist[K-1] {
 		return
 	}
@@ -216,37 +243,33 @@ func (t *topK) fraudScore() float64 {
 	return float64(fraudCount) / float64(K)
 }
 
-// Score returns the fraud fraction among the K nearest reference vectors. It
-// quantizes the query and dispatches to the configured search strategy.
+// Score returns the fraud fraction among the K nearest reference vectors. The
+// query is NOT quantized — it stays full-precision float64 and is compared
+// against the dequantized refs (exact reproduction of the ground-truth 5-NN).
 func (ix *Index) Score(query [vectorize.Dims]float64) float64 {
 	if ix.n == 0 {
 		return 0
 	}
 
-	var q [vectorize.Dims]uint16
-	for i := 0; i < vectorize.Dims; i++ {
-		q[i] = quantize(query[i])
-	}
-
 	switch ix.mode {
 	case modeVPTree:
-		return ix.vp.search(ix, &q)
+		return ix.vp.search(ix, &query)
 	case modeIVF:
-		return ix.ivf.search(ix, &q)
+		return ix.ivf.search(ix, &query)
 	default:
-		return ix.bruteScore(&q)
+		return ix.bruteScore(&query)
 	}
 }
 
 // bruteScore scans every row — exact, O(n). The fallback and the small-N path.
-func (ix *Index) bruteScore(q *[vectorize.Dims]uint16) float64 {
+func (ix *Index) bruteScore(q *[vectorize.Dims]float64) float64 {
 	tk := ix.bruteTopK(q)
 	return tk.fraudScore()
 }
 
 // bruteTopK is the exact K nearest by full scan (used by bruteScore and by the
 // VP-tree/IVF correctness tests as the source of truth).
-func (ix *Index) bruteTopK(q *[vectorize.Dims]uint16) topK {
+func (ix *Index) bruteTopK(q *[vectorize.Dims]float64) topK {
 	tk := newTopK()
 	for idx := 0; idx < ix.n; idx++ {
 		tk.consider(ix.dist2(q, idx), ix.isFraud(idx))

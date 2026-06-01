@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"rinha-fraud/internal/knn"
+	"rinha-fraud/internal/model"
 	"rinha-fraud/internal/vectorize"
 )
 
@@ -44,6 +45,22 @@ func env(k, def string) string {
 	return def
 }
 
+// loadModelOrNil loads the Caminho C GBDT for the "model" method; nil (skipped)
+// if absent/invalid.
+func loadModelOrNil(path string) *model.Model {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		log.Printf("model: %v (método model pulado)", err)
+		return nil
+	}
+	m, err := model.LoadModel(b)
+	if err != nil {
+		log.Printf("model: %v (método model pulado)", err)
+		return nil
+	}
+	return m
+}
+
 func main() {
 	refPath := env("REFERENCES_PATH", "./resources/references.json.gz")
 	testPath := env("TESTDATA_PATH", "../rinha-de-backend-2026/test/test-data.json")
@@ -53,6 +70,44 @@ func main() {
 	log.Printf("cores=%d", runtime.NumCPU())
 
 	vec := loadVectorizer(normPath, mccPath)
+
+	// Fast path: just the GBDT model vs the test-data 5-NN labels (no refs/oracle).
+	if os.Getenv("MODEL_ONLY") != "" {
+		mdl := loadModelOrNil(env("MODEL_PATH", "./resources/model.json"))
+		if mdl == nil {
+			log.Fatal("MODEL_ONLY set but no model loaded")
+		}
+		tf := loadTestData(testPath)
+		mm := len(tf.Entries)
+		log.Printf("MODEL_ONLY: %d entries — tau-sweep (baked tau=%.3f)", mm, mdl.Tau())
+		mp := make([]float64, mm)
+		exp := make([]bool, mm)
+		for i := range tf.Entries {
+			e := &tf.Entries[i]
+			mp[i] = mdl.Score(vec.Vectorize(&e.Request))
+			exp[i] = e.ExpectedApproved
+		}
+		fmt.Println("tau      FP     FN  failures   fail%%   det_score")
+		for _, tau := range []float64{0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60} {
+			fp, fn := 0, 0
+			for i := 0; i < mm; i++ {
+				ap := mp[i] < tau
+				if ap == exp[i] {
+					continue
+				}
+				if ap {
+					fn++
+				} else {
+					fp++
+				}
+			}
+			fail := fp + fn
+			fmt.Printf("%.2f   %5d  %5d  %7d  %6.3f%%  %+8.1f\n",
+				tau, fp, fn, fail, 100*float64(fail)/float64(mm), detScore(fp, fn, 0, mm))
+		}
+		fmt.Println("(comparar com IVF×10000 do Caminho A = 34 failures / +2482.7)")
+		return
+	}
 
 	// --- load references: raw float64 (exact oracle) + two quantized indexes ---
 	log.Printf("loading references from %s ...", refPath)
@@ -73,6 +128,12 @@ func main() {
 	t1 := time.Now()
 	idxIVF.Build(knn.BuildConfig{Mode: "ivf", NList: 4096, NProbe: 12, Iters: 8})
 	log.Printf("IVF built in %s", time.Since(t1))
+
+	// Caminho C: trained GBDT (optional). The "model" method below uses it.
+	mdl := loadModelOrNil(env("MODEL_PATH", "./resources/model.json"))
+	if mdl != nil {
+		log.Printf("model (GBDT) loaded; baked tau=%.3f", mdl.Tau())
+	}
 
 	// --- load + vectorize the labeled test data ---
 	tf := loadTestData(testPath)
@@ -101,7 +162,8 @@ func main() {
 	f64Cnt := make([]uint8, m)
 	u8Cnt := make([]uint8, m)
 	ivfCnt := make([]uint8, m)
-	log.Printf("scoring %d entries x3 methods (float64-exact + uint8-brute + IVF) ...", m)
+	modelP := make([]float64, m) // GBDT P(fraud); 0 if no model
+	log.Printf("scoring %d entries (float64-exact + u16-brute + IVF + model) ...", m)
 	t2 := time.Now()
 	parallelChunks(m, func(lo, hi int) {
 		for i := lo; i < hi; i++ {
@@ -109,6 +171,9 @@ func main() {
 			f64Cnt[i] = uint8(bruteF64(refsF, labels, n, &q))
 			u8Cnt[i] = uint8(math.Round(idxBrute.Score(q) * float64(knn.K)))
 			ivfCnt[i] = uint8(math.Round(idxIVF.Score(q) * float64(knn.K)))
+			if mdl != nil {
+				modelP[i] = mdl.Score(q)
+			}
 		}
 	})
 	log.Printf("scored in %s", time.Since(t2))
@@ -124,7 +189,7 @@ func main() {
 		cnt  []uint8
 	}{
 		{"float64-exact", f64Cnt},
-		{"u16-brute    ", u8Cnt},
+		{"u16/f64-brute", u8Cnt},
 		{"IVF (4096/12)", ivfCnt},
 	} {
 		tp, tn, fp, fn := 0, 0, 0, 0
@@ -230,6 +295,38 @@ func main() {
 	}
 	idx8192.Build(knn.BuildConfig{Mode: "ivf", NList: 8192, NProbe: 12, Iters: 8})
 	sweepIVF(idx8192, qs, expApproved, approved, 8192, []int{12, 24}, n)
+
+	// --- método MODEL (GBDT): sweep de tau (approved = P(fraude) < tau) ----
+	if mdl != nil {
+		fmt.Println("\n================ MÉTODO MODEL (GBDT, Caminho C) ================")
+		fmt.Println("(detecção; p99 medido no docker. tau calibra a fronteira approved<tau)")
+		fmt.Println("tau      FP     FN  failures   fail%%   det_score")
+		bestTau, bestDet, bestFail := 0.0, math.Inf(-1), 0
+		for _, tau := range []float64{0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60} {
+			fp, fn := 0, 0
+			for i := 0; i < m; i++ {
+				ap := modelP[i] < tau
+				if ap == expApproved[i] {
+					continue
+				}
+				if ap {
+					fn++
+				} else {
+					fp++
+				}
+			}
+			fail := fp + fn
+			det := detScore(fp, fn, 0, m)
+			fmt.Printf("%.2f   %5d  %5d  %7d  %6.3f%%  %+8.1f\n",
+				tau, fp, fn, fail, 100*float64(fail)/float64(m), det)
+			if det > bestDet {
+				bestDet, bestTau, bestFail = det, tau, fail
+			}
+		}
+		fmt.Printf("melhor: tau=%.2f  failures=%d  det_score=%+.1f  (vs IVF×10000 = 34 / +2482.7)\n",
+			bestTau, bestFail, bestDet)
+		fmt.Println("nota: tau varrido sobre o test-data (calibração de 1 escalar); confirmar em held-out.")
+	}
 
 	fmt.Println("\n(p99 é medido separadamente com run-test.ps1; aqui o proxy de custo é linhas/query)")
 }

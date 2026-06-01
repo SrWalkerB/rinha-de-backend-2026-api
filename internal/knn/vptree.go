@@ -28,7 +28,7 @@ type vpNode struct {
 
 type vpPair struct {
 	id int32
-	d2 uint64
+	d2 float64
 }
 
 type vpBuilder struct {
@@ -83,7 +83,7 @@ func (b *vpBuilder) build(lo, hi int) int32 {
 
 	// Recurse first (append children), then fix this node's fields — appending
 	// to b.t.nodes may reallocate, so never cache a *vpNode across recursion.
-	radius := float32(math.Sqrt(float64(medianD2)))
+	radius := float32(math.Sqrt(medianD2))
 	inner := b.build(lo+1, lo+1+mid)
 	outer := b.build(lo+1+mid, hi)
 	b.t.nodes[ni].radius = radius
@@ -92,18 +92,18 @@ func (b *vpBuilder) build(lo, hi int) int32 {
 	return ni
 }
 
-func (t *vpTree) search(ix *Index, q *[vectorize.Dims]uint16) float64 {
+func (t *vpTree) search(ix *Index, q *[vectorize.Dims]float64) float64 {
 	tk := t.searchTopK(ix, q)
 	return tk.fraudScore()
 }
 
-func (t *vpTree) searchTopK(ix *Index, q *[vectorize.Dims]uint16) topK {
+func (t *vpTree) searchTopK(ix *Index, q *[vectorize.Dims]float64) topK {
 	tk := newTopK()
 	t.searchNode(ix, q, t.root, &tk)
 	return tk
 }
 
-func (t *vpTree) searchNode(ix *Index, q *[vectorize.Dims]uint16, ni int32, tk *topK) {
+func (t *vpTree) searchNode(ix *Index, q *[vectorize.Dims]float64, ni int32, tk *topK) {
 	if ni < 0 {
 		return
 	}
@@ -118,19 +118,19 @@ func (t *vpTree) searchNode(ix *Index, q *[vectorize.Dims]uint16, ni int32, tk *
 
 	// Pruning uses TRUE distances (the triangle inequality does not hold for
 	// squared distances). These sqrt calls run only on visited nodes (few).
-	d := math.Sqrt(float64(d2))
+	d := math.Sqrt(d2)
 	r := float64(t.nodes[ni].radius)
 
 	if d < r {
 		// Query is inside the radius: the inner subtree is the closer one.
 		t.searchNode(ix, q, inner, tk)
-		tau := math.Sqrt(float64(tk.worst())) // current K-th distance (search radius)
+		tau := math.Sqrt(tk.worst()) // current K-th distance (search radius)
 		if d+tau >= r {
 			t.searchNode(ix, q, outer, tk)
 		}
 	} else {
 		t.searchNode(ix, q, outer, tk)
-		tau := math.Sqrt(float64(tk.worst()))
+		tau := math.Sqrt(tk.worst())
 		if d-tau <= r {
 			t.searchNode(ix, q, inner, tk)
 		}

@@ -44,14 +44,6 @@ func randomQueries(n int, seed int64) [][vectorize.Dims]float64 {
 	return qs
 }
 
-func quantizeQuery(q [vectorize.Dims]float64) [vectorize.Dims]uint16 {
-	var out [vectorize.Dims]uint16
-	for i := range out {
-		out[i] = quantize(q[i])
-	}
-	return out
-}
-
 // TestVPTreeExactMatchesBrute: the VP-tree must return the SAME K nearest
 // distances as brute force for every query (it is an exact method). Comparing
 // the sorted distance multiset is tie-safe.
@@ -68,9 +60,9 @@ func TestVPTreeExactMatchesBrute(t *testing.T) {
 	}
 
 	for i, q := range randomQueries(300, 99) {
-		qq := quantizeQuery(q)
-		want := ref.bruteTopK(&qq)
-		got := vp.vp.searchTopK(vp, &qq)
+		q := q // addressable per-iteration copy
+		want := ref.bruteTopK(&q)
+		got := vp.vp.searchTopK(vp, &q)
 		if got.dist != want.dist {
 			t.Fatalf("query %d: VP distances %v != brute %v", i, got.dist, want.dist)
 		}
@@ -94,9 +86,9 @@ func TestIVFRecallHigh(t *testing.T) {
 	queries := randomQueries(300, 123)
 	var totalRecall float64
 	for _, q := range queries {
-		qq := quantizeQuery(q)
-		want := ref.bruteTopK(&qq)
-		got := ivf.ivf.searchTopK(ivf, &qq)
+		q := q
+		want := ref.bruteTopK(&q)
+		got := ivf.ivf.searchTopK(ivf, &q)
 		totalRecall += recallAtK(want, got)
 	}
 	mean := totalRecall / float64(len(queries))

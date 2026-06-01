@@ -26,6 +26,8 @@ o `final_score` pro positivo — entendendo cada passo.
 | [05](05-preprocessamento-no-build.md) | Pré-processo no build | Construir o índice no Docker build (startup rápido, nlist grande) | ✅ (p99 1202→484ms, +395) |
 | [06](06-simd-avancado.md) | SIMD (avançado) | Vetorizar o cálculo de distância | 📋 guia (opcional, `GOAMD64=v3` não ligado) |
 | [07](07-diagnostico-failures.md) | Diagnóstico das failures | Harness offline; failures = quantização (não IVF!); fix uint16 | ✅ (det +1216→+1430) |
+| [08](08-quantizacao-grade-nativa.md) | Quantização na grade nativa | Dado 4-casas → uint16 lossless ×10000 + dist **float64** + LUT; brute=**0 failures** | ✅ (det +1430→**+2496**; final 1843→**2742**) |
+| 09 | Classificador GBDT (IA) — ver [JORNADA](JORNADA-E-DECISOES.md) §9 | xgboost offline → inferência Go pura (paridade 5.9e-8), `SCORER=model`; `cmd/genlabels` p/ imitação 5-NN | ⚠️ aprendizado ✅ / score perdeu: muro ~1.8% (imitação 5-NN E +capacidade refutadas → capacidade vs fronteira). A vence; topo = 5-NN exato rápido |
 
 Template para criar/seguir cada doc: [`_template.md`](_template.md).
 
@@ -47,14 +49,18 @@ direto do `results.json` gerado pelo `run-test.ps1`.
 | 04 | + nprobe=6, GOGC=off | 2026-05-30 | 1202ms | 0.51% | -80 | +1217 | **+1136** | +358 | docker-9999 | **Err: 0** — 100% das requests atendidas (40.300, zero timeout) |
 | 05 | índice no build, nlist=4096 nprobe=12 | 2026-05-30 | 484ms | 0.50% | +315 | +1216 | **+1531** | +395 | docker-9999 | startup 25ms (era ~85s); **p99 1202→484ms**; Err=0; o 0.5% é FP+FN (classificação), não timeout |
 | 07 | quantização **uint16** (era uint8) | 2026-05-31 | 387ms | 0.33% | +413 | +1430 | **+1843** | +312 | docker-9999 | diagnóstico provou: failures eram QUANTIZAÇÃO, não IVF. uint16 → det +1216→**+1430** (portável). p99 não piorou (banda 2× irrelevante; IVF varre poucas linhas) |
+| 08 | grade **×10000** lossless + dist **float64** + LUT | 2026-05-31 | 567ms* | 0.06% | +247* | **+2496** | **+2742** | +899 | docker-9999* | brute = **0 failures** (= float64-exato); IVF só recall (34/54100). det **portável** +1067. *p99 inflado por contenção do host na medição (10 containers); dequant via LUT cortou a divisão do hot path (702→567ms) |
+| 09 | GBDT (xgboost) | 2026-05-31 | 214ms* | 1.85% | +670* | +369 | **+1039** | −1703 | docker-9999* | inferência Go pura (paridade 5.9e-8); p99 567→214 (compute ↓) mas *host contido (não sub-ms aqui); detecção afunda → **A (2742) vence**. Imitação 5-NN (det +410) E +capacidade (depth12/300: overfit, pior) **testadas e refutadas**: muro ~1.8% (capacidade vs fronteira). Topo = 5-NN exato rápido, não GBDT |
 
-**Estado atual (local): `+1843`** (rank oficial no Mac Mini foi 1460 com uint8). Objetivo "0
-timeout / 100% atendido" ✅ (`Err=0` desde o passo 04). A jornada: p99 caiu de 2002ms→**387ms**
-(passos 03-05) e as failures de classificação de 0.5%→**0.33%** (passo 07, uint16). O ganho do
-passo 07 é o **`detection_score` +1216→+1430**, que é **portável** (independe de hardware) — então
-vale igual no Mac Mini. As failures restantes (0.33%) são FP+FN de fronteira; o piso de precisão
-do uint16 é ~144 (doc 07). Próximo salto de verdade (rumo a 0 failures + p99 sub-ms) = **classificador
-treinado** (doc 07, veredito final).
+**Estado atual (local): `+2742`** (era +1843; rank oficial no Mac Mini foi 1460 com uint8). Objetivo "0
+timeout / 100% atendido" ✅ (`Err=0` desde o passo 04). A jornada: p99 caiu de 2002ms→~387ms (passos
+03-05) e as failures de classificação de 0.5%→**0.06%** (passo 08). O salto do passo 08: o dado é
+exatamente 4-casas → cabe **lossless** em uint16 (×10000) e, com **distância float64** contra a query
+crua, o brute reproduz o gabarito **exato (0 failures)** dentro de 84MB — o piso de quantização (144)
+sumiu. `detection_score` **+1430 → +2496** (Δ +1067, **portável**). As 34 failures restantes do IVF são
+**só recall** (não quantização). Gargalo dominante agora é o **p99** (p99_score ~247 vs teto 3000).
+Próximo salto (rumo a 0 failures + p99 sub-ms) = **classificador treinado / GBDT** (Caminho C; spec em
+`docs/superpowers/specs/`).
 
 ## Como medir (atalho)
 

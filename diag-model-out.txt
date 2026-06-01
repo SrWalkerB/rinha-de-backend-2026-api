@@ -1,0 +1,78 @@
+2026/05/31 11:58:11 cores=32
+2026/05/31 11:58:11 loading references from ./resources/references.json.gz ...
+2026/05/31 11:58:18 loaded 3000000 refs in 7.0645658s (sha256=24a1fd588e2598ab...)
+2026/05/31 11:58:19 building IVF (nlist=4096 nprobe=12) ...
+2026/05/31 11:58:33 IVF built in 14.3553106s
+2026/05/31 11:58:33 model (GBDT) loaded; baked tau=0.500
+2026/05/31 11:58:33 test-data: 54100 entries (stats.total=54100 edge_cases=645)
+2026/05/31 11:58:33 checksum: MATCH — our references match the labeled set
+2026/05/31 11:58:33 scoring 54100 entries (float64-exact + u16-brute + IVF + model) ...
+2026/05/31 12:07:46 scored in 9m12.4065812s
+
+================ DIAGNÓSTICO DE FAILURES ================
+N = 54100 entries
+
+Método            TP     TN     FP     FN   failures   fail%%   det_score
+float64-exact  23959  30141      0      0        0   0.000%   +3000.0
+u16/f64-brute  23959  30141      0      0        0   0.000%   +3000.0
+IVF (4096/12)  23950  30116     25      9       34   0.063%   +2482.7
+
+---- atribuição das failures pontuadas (IVF != expected) ----
+total            : 34
+vetorização      :    0 (0.0%)  -> custo ZERO de latência se corrigir
+quantização u16  :    0 (0.0%)  -> precisão dos buckets
+recall do IVF    :   34 (100.0%)  -> nprobe/nlist (custa p99)
+
+---- failures por contagem de fraude esperada (fronteira = 2 e 3) ----
+  0/5 (score 0.0):    0
+  1/5 (score 0.2):    4
+  2/5 (score 0.4):   21  <- fronteira
+  3/5 (score 0.6):    9  <- fronteira
+  4/5 (score 0.8):    0
+  5/5 (score 1.0):    0
+
+---- fidelidade da vetorização ----
+fraud_score float64-exato == expected_fraud_score: 54098/54100 (99.996%)
+
+---- exemplos de entries que o IVF erra (exp / f64 / ivf, contagem de fraude) ----
+  tx-869781288     exp=2  f64=2  ivf=3
+  tx-1523512129    exp=2  f64=2  ivf=3
+  tx-3921153185    exp=2  f64=2  ivf=3
+  tx-2670248037    exp=2  f64=2  ivf=4
+  tx-4256983008    exp=1  f64=1  ivf=4
+  tx-3898318786    exp=2  f64=2  ivf=4
+  tx-1616208889    exp=2  f64=2  ivf=3
+  tx-4029101443    exp=3  f64=3  ivf=2
+  tx-1561890025    exp=2  f64=2  ivf=3
+  tx-4121888760    exp=2  f64=2  ivf=3
+  tx-2587736876    exp=3  f64=3  ivf=2
+  tx-1352184286    exp=2  f64=2  ivf=3
+  tx-2466999149    exp=2  f64=2  ivf=3
+  tx-3180732666    exp=2  f64=2  ivf=3
+  tx-2082051090    exp=1  f64=1  ivf=3
+
+---- sweep IVF: recall vs custo (linhas varridas/query ≈ nprobe·n/nlist) ----
+config              FP     FN  failures   fail%%   det_score   linhas/query
+nlist=4096  nprobe=8      30     14       44   0.081%   +2316.9      5856
+nlist=4096  nprobe=12     25      9       34   0.063%   +2482.7      8784
+nlist=4096  nprobe=16     18      6       24   0.044%   +2529.5     11712
+nlist=4096  nprobe=24      9      5       14   0.026%   +2580.6     17568
+nlist=4096  nprobe=32      5      2        7   0.013%   +2676.2     23424
+2026/05/31 12:08:00 building IVF nlist=8192 for the sweep ...
+nlist=8192  nprobe=12     20     12       32   0.059%   +2458.2      4392
+nlist=8192  nprobe=24     13      4       17   0.031%   +2575.5      8784
+
+================ MÉTODO MODEL (GBDT, Caminho C) ================
+(detecção; p99 medido no docker. tau calibra a fronteira approved<tau)
+tau      FP     FN  failures   fail%%   det_score
+0.30     397    616     1013   1.872%    +376.6
+0.35     387    623     1010   1.867%    +373.8
+0.40     363    638     1001   1.850%    +368.6
+0.45     323    673      996   1.841%    +352.7
+0.50     264    730      994   1.837%    +326.3
+0.55     218    787     1005   1.858%    +298.3
+0.60     183    824     1007   1.861%    +281.9
+melhor: tau=0.30  failures=1013  det_score=+376.6  (vs IVF×10000 = 34 / +2482.7)
+nota: tau varrido sobre o test-data (calibração de 1 escalar); confirmar em held-out.
+
+(p99 é medido separadamente com run-test.ps1; aqui o proxy de custo é linhas/query)

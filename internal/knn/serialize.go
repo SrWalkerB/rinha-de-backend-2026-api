@@ -18,6 +18,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 	"os"
 
 	"rinha-fraud/internal/vectorize"
@@ -25,7 +26,7 @@ import (
 
 const (
 	indexMagic   uint32 = 0x52464958 // "RFIX"
-	indexVersion uint32 = 2          // v2: data/centroids are uint16 (was uint8 in v1)
+	indexVersion uint32 = 3          // v3: refs uint16 on x10000 grid + float64 distance; centroids float64 (v2 was x65534 uint16, uint64 distance)
 )
 
 // Save writes the built index to path. Only IVF and brute modes are
@@ -128,7 +129,7 @@ func (f *ivfIndex) writeTo(w io.Writer) error {
 	if err := writeU32(w, uint32(f.nprobe)); err != nil {
 		return err
 	}
-	if err := writeU16Slice(w, f.centroids); err != nil {
+	if err := writeF64Slice(w, f.centroids); err != nil {
 		return err
 	}
 
@@ -159,7 +160,7 @@ func readIVF(r io.Reader) (*ivfIndex, error) {
 	if err != nil {
 		return nil, err
 	}
-	centroids, err := readU16Slice(r)
+	centroids, err := readF64Slice(r)
 	if err != nil {
 		return nil, err
 	}
@@ -335,6 +336,34 @@ func readU64Slice(r io.Reader) ([]uint64, error) {
 	s := make([]uint64, int(n))
 	for i := range s {
 		s[i] = binary.LittleEndian.Uint64(buf[i*8:])
+	}
+	return s, nil
+}
+
+func writeF64Slice(w io.Writer, s []float64) error {
+	if err := writeU64(w, uint64(len(s))); err != nil {
+		return err
+	}
+	buf := make([]byte, len(s)*8)
+	for i, v := range s {
+		binary.LittleEndian.PutUint64(buf[i*8:], math.Float64bits(v))
+	}
+	_, err := w.Write(buf)
+	return err
+}
+
+func readF64Slice(r io.Reader) ([]float64, error) {
+	n, err := readU64(r)
+	if err != nil {
+		return nil, err
+	}
+	buf := make([]byte, int(n)*8)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return nil, err
+	}
+	s := make([]float64, int(n))
+	for i := range s {
+		s[i] = math.Float64frombits(binary.LittleEndian.Uint64(buf[i*8:]))
 	}
 	return s, nil
 }

@@ -19,16 +19,25 @@ import (
 
 	"rinha-fraud/internal/dataset"
 	"rinha-fraud/internal/knn"
+	"rinha-fraud/internal/model"
 	"rinha-fraud/internal/vectorize"
 )
 
-//go:embed resources/normalization.json resources/mcc_risk.json
+//go:embed resources/normalization.json resources/mcc_risk.json resources/model.json
 var resourcesFS embed.FS
 
 type server struct {
 	vec   *vectorize.Vectorizer
-	index atomic.Pointer[knn.Index]
+	sc    atomic.Pointer[scorer]
 	ready atomic.Bool
+}
+
+// scorer is the pluggable classifier behind POST /fraud-score: the KNN index
+// (Caminho A, SCORER=knn) or the trained GBDT (Caminho C, SCORER=model). A
+// transaction is approved when score(vec) < thr.
+type scorer struct {
+	score func([vectorize.Dims]float64) float64
+	thr   float64
 }
 
 type response struct {
@@ -62,14 +71,14 @@ func (s *server) handleScore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ix := s.index.Load()
-	if ix == nil {
+	sc := s.sc.Load()
+	if sc == nil {
 		writeJSON(w, fallback)
 		return
 	}
 
-	score := ix.Score(s.vec.Vectorize(&p))
-	writeJSON(w, response{Approved: score < knn.Threshold, FraudScore: score})
+	score := sc.score(s.vec.Vectorize(&p))
+	writeJSON(w, response{Approved: score < sc.thr, FraudScore: score})
 }
 
 func writeJSON(w http.ResponseWriter, resp response) {
@@ -143,15 +152,33 @@ func main() {
 
 	refPath := getenv("REFERENCES_PATH", "./resources/references.json.gz")
 	capHint := atoiEnv("REFERENCES_CAPACITY", 3_000_000)
+	scorerKind := getenv("SCORER", "knn")
 	go func() {
-		// Fast path: a pre-built index baked at image-build time (step 05). Load
-		// it and skip k-means entirely. KNN_NPROBE retunes it without rebuilding.
+		// Caminho C: trained GBDT. No dataset/index — load the embedded model.json
+		// (a few hundred KB) and score by walking ~100 small trees. Sub-ms, tiny RAM.
+		if scorerKind == "model" {
+			b, err := resourcesFS.ReadFile("resources/model.json")
+			if err != nil {
+				log.Fatalf("read model: %v", err)
+			}
+			mdl, err := model.LoadModel(b)
+			if err != nil {
+				log.Fatalf("load model: %v", err)
+			}
+			s.sc.Store(&scorer{score: mdl.Score, thr: mdl.Tau()})
+			s.ready.Store(true)
+			log.Printf("ready: GBDT model loaded (tau=%.3f)", mdl.Tau())
+			return
+		}
+
+		// SCORER=knn (default). Fast path: a pre-built index baked at image-build
+		// time (step 05). Load it and skip k-means. KNN_NPROBE retunes it.
 		if path := getenv("INDEX_PATH", ""); path != "" {
 			t0 := time.Now()
 			ix, err := knn.LoadIndex(path)
 			if err == nil {
 				ix.SetNProbe(atoiEnv("KNN_NPROBE", 0)) // 0 => keep the baked value
-				s.index.Store(ix)
+				s.sc.Store(&scorer{score: ix.Score, thr: knn.Threshold})
 				s.ready.Store(true)
 				log.Printf("ready: loaded prebuilt index %s (%d vectors) in %s",
 					path, ix.Len(), time.Since(t0))
@@ -179,7 +206,7 @@ func main() {
 		ix.Build(cfg)
 		log.Printf("index built in %s", time.Since(t0))
 
-		s.index.Store(ix)
+		s.sc.Store(&scorer{score: ix.Score, thr: knn.Threshold})
 		s.ready.Store(true)
 		log.Printf("ready: %d reference vectors loaded", ix.Len())
 	}()

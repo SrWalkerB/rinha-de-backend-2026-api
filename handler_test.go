@@ -44,7 +44,7 @@ func serverWithFraudNeighbors(t *testing.T) *server {
 		ix.Add(fv, true)
 	}
 	s := &server{vec: vec}
-	s.index.Store(ix)
+	s.sc.Store(&scorer{score: ix.Score, thr: knn.Threshold})
 	s.ready.Store(true)
 	return s
 }

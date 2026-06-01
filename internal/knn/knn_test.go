@@ -15,7 +15,8 @@ func mkvec(base float64) [vectorize.Dims]float64 {
 	return v
 }
 
-// quantize pins the uint16 mapping: -1 sentinel -> 0, [0,1] -> [1,65535], monotonic.
+// quantize pins the uint16 storage mapping on the data's native 4-decimal grid:
+// -1 sentinel -> 0, [0,1] -> [1,10001], monotonic.
 func TestQuantizeMapping(t *testing.T) {
 	if got := quantize(-1); got != 0 {
 		t.Errorf("quantize(-1) = %d, want 0", got)
@@ -23,11 +24,24 @@ func TestQuantizeMapping(t *testing.T) {
 	if got := quantize(0); got != 1 {
 		t.Errorf("quantize(0) = %d, want 1", got)
 	}
-	if got := quantize(1); got != 65535 {
-		t.Errorf("quantize(1) = %d, want 65535", got)
+	if got := quantize(1); got != 10001 {
+		t.Errorf("quantize(1) = %d, want 10001", got)
 	}
 	if quantize(0.5) <= quantize(0.25) {
 		t.Errorf("quantize not monotonic: q(0.5)=%d q(0.25)=%d", quantize(0.5), quantize(0.25))
+	}
+}
+
+// dequant must reverse quantize bit-exactly for 4-decimal values, so float64
+// distance against an un-quantized query equals the ground-truth exact search.
+func TestDequantRoundTrip(t *testing.T) {
+	if got := dequant(0); got != -1 {
+		t.Errorf("dequant(0) = %v, want -1 (sentinel)", got)
+	}
+	for _, v := range []float64{0, 0.0001, 0.0833, 0.3913, 0.8261, 0.9999, 1} {
+		if got := dequant(quantize(v)); got != v {
+			t.Errorf("dequant(quantize(%v)) = %v, want exact", v, got)
+		}
 	}
 }
 

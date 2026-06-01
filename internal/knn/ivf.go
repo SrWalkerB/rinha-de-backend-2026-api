@@ -17,7 +17,7 @@ const maxProbe = 64
 // APPROXIMATE — the true K-NN may sit in an unscanned cell — trading a little
 // recall for a large speedup. Higher nprobe => better recall, slower query.
 type ivfIndex struct {
-	centroids []uint16  // nlist * Dims
+	centroids []float64 // nlist * Dims, in the [0,1]/sentinel value space
 	lists     [][]int32 // row ids per cell
 	nlist     int
 	nprobe    int
@@ -49,7 +49,7 @@ func buildIVF(ix *Index, cfg BuildConfig) *ivfIndex {
 	}
 
 	f := &ivfIndex{
-		centroids: make([]uint16, nlist*D),
+		centroids: make([]float64, nlist*D),
 		lists:     make([][]int32, nlist),
 		nlist:     nlist,
 		nprobe:    nprobe,
@@ -62,7 +62,9 @@ func buildIVF(ix *Index, cfg BuildConfig) *ivfIndex {
 	}
 	for c := 0; c < nlist; c++ {
 		row := c * stride
-		copy(f.centroids[c*D:(c+1)*D], ix.data[row*D:(row+1)*D])
+		for d := 0; d < D; d++ {
+			f.centroids[c*D+d] = dequant(ix.data[row*D+d])
+		}
 	}
 
 	// Train on a sample (bounds build cost), then assign every row to a cell.
@@ -114,7 +116,7 @@ func (f *ivfIndex) trainKMeans(ix *Index, sample []int32, iters int) {
 			off := int(row) * D
 			base := c * D
 			for d := 0; d < D; d++ {
-				sum[base+d] += float64(ix.data[off+d])
+				sum[base+d] += dequant(ix.data[off+d])
 			}
 			cnt[c]++
 		}
@@ -124,7 +126,7 @@ func (f *ivfIndex) trainKMeans(ix *Index, sample []int32, iters int) {
 			}
 			base := c * D
 			for d := 0; d < D; d++ {
-				f.centroids[base+d] = uint16(math.Round(sum[base+d] / float64(cnt[c])))
+				f.centroids[base+d] = sum[base+d] / float64(cnt[c])
 			}
 		}
 	}
@@ -191,19 +193,19 @@ func parallelFor(n int, fn func(lo, hi int)) {
 	wg.Wait()
 }
 
-// nearestCentroid returns the index of the centroid closest to row.
+// nearestCentroid returns the index of the centroid closest to row (float64).
 func (f *ivfIndex) nearestCentroid(ix *Index, row int) int {
 	D := vectorize.Dims
 	off := row * D
 	data := ix.data
 	best := 0
-	var bestD uint64 = math.MaxUint64
+	bestD := math.MaxFloat64
 	for c := 0; c < f.nlist; c++ {
 		base := c * D
-		var dist uint64
+		var dist float64
 		for d := 0; d < D; d++ {
-			diff := int64(data[off+d]) - int64(f.centroids[base+d])
-			dist += uint64(diff * diff)
+			diff := dequant(data[off+d]) - f.centroids[base+d]
+			dist += diff * diff
 		}
 		if dist < bestD {
 			bestD = dist
@@ -214,30 +216,30 @@ func (f *ivfIndex) nearestCentroid(ix *Index, row int) int {
 }
 
 // centroidDist returns the squared distance from query q to centroid c.
-func (f *ivfIndex) centroidDist(q *[vectorize.Dims]uint16, c int) uint64 {
+func (f *ivfIndex) centroidDist(q *[vectorize.Dims]float64, c int) float64 {
 	D := vectorize.Dims
 	base := c * D
-	var dist uint64
+	var dist float64
 	for d := 0; d < D; d++ {
-		diff := int64(q[d]) - int64(f.centroids[base+d])
-		dist += uint64(diff * diff)
+		diff := q[d] - f.centroids[base+d]
+		dist += diff * diff
 	}
 	return dist
 }
 
-func (f *ivfIndex) search(ix *Index, q *[vectorize.Dims]uint16) float64 {
+func (f *ivfIndex) search(ix *Index, q *[vectorize.Dims]float64) float64 {
 	tk := f.searchTopK(ix, q)
 	return tk.fraudScore()
 }
 
-func (f *ivfIndex) searchTopK(ix *Index, q *[vectorize.Dims]uint16) topK {
+func (f *ivfIndex) searchTopK(ix *Index, q *[vectorize.Dims]float64) topK {
 	np := f.nprobe
 
 	// Select the nprobe nearest centroids into stack arrays (no allocation).
-	var pd [maxProbe]uint64
+	var pd [maxProbe]float64
 	var pc [maxProbe]int32
 	for i := 0; i < np; i++ {
-		pd[i] = math.MaxUint64
+		pd[i] = math.MaxFloat64
 	}
 	for c := 0; c < f.nlist; c++ {
 		dist := f.centroidDist(q, c)
