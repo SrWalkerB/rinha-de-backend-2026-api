@@ -225,6 +225,24 @@ func (ix *Index) Score(query [Dims]float64) float64 {
 	return tk.fraudScore()
 }
 
+// ScoreCount returns the fraud count among the (approximately) K nearest
+// reference vectors (0..K). It runs the same stack-only search path as Score, so
+// float64(ScoreCount(q))/K == Score(q). The handler uses the integer count to
+// index a precomputed response, keeping the hot path allocation-free.
+func (ix *Index) ScoreCount(query [Dims]float64) int {
+	if ix.n == 0 {
+		return 0
+	}
+	tk, _ := ix.searchTopK(&query)
+	n := 0
+	for i := 0; i < K; i++ {
+		if tk.fraud[i] {
+			n++
+		}
+	}
+	return n
+}
+
 // ScoreScan is like Score but also returns the number of reference rows visited.
 // Diagnostic only.
 func (ix *Index) ScoreScan(query [Dims]float64) (float64, int) {

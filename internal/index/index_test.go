@@ -49,6 +49,29 @@ func bruteScore(ix *Index, q *[Dims]float64) float64 {
 	return tk.fraudScore()
 }
 
+// --- score / count --------------------------------------------------------
+
+// TestScoreCountMatchesScore guards the invariant the handler relies on:
+// ScoreCount runs the same search as Score, so float64(ScoreCount(q))/K == Score(q)
+// exactly. A future change to one but not the other would break response routing.
+func TestScoreCountMatchesScore(t *testing.T) {
+	var rows []row
+	for i := 0; i < 20; i++ {
+		rows = append(rows, row{mkvec(float64(i) / 100), i%2 == 0})
+	}
+	ix := buildIndex(rows)
+	for _, base := range []float64{0, 0.05, 0.1, 0.19, 0.5} {
+		q := mkvec(base)
+		count := ix.ScoreCount(q)
+		if count < 0 || count > K {
+			t.Errorf("base %v: count %d out of [0,%d]", base, count, K)
+		}
+		if got, want := float64(count)/float64(K), ix.Score(q); got != want {
+			t.Errorf("base %v: ScoreCount/K = %v, Score = %v", base, got, want)
+		}
+	}
+}
+
 // --- quantization ---------------------------------------------------------
 
 func TestQuantizeMapping(t *testing.T) {

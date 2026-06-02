@@ -3,12 +3,14 @@
 package main
 
 import (
+	"bytes"
 	"embed"
 	"encoding/json"
 	"log"
 	"net/http"
 	"os"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -36,9 +38,49 @@ type response struct {
 	FraudScore float64 `json:"fraud_score"`
 }
 
-// fallback is returned on any error: a fast 200 avoids the heavily-weighted
-// HTTP-error penalty (AVALIACAO.md) at the cost of a possible FP/FN.
-var fallback = response{Approved: true, FraudScore: 0.0}
+// There are only K+1 possible answers: fraud_score = n/K for a fraud count n in
+// 0..K, with approved = (score < Threshold). Pre-render each one ONCE so the hot
+// path writes bytes with zero allocation. They are built with json.Marshal (plus
+// the trailing '\n' json.Encoder.Encode used to add), so the wire bytes stay
+// byte-identical to the old encoder. Package init runs before tests, too.
+var responseBody = buildResponses()
+
+// fallbackBody is returned on any error: a fast 200 avoids the heavily-weighted
+// HTTP-error penalty (AVALIACAO.md) at the cost of a possible FP/FN. It is the
+// n=0 answer: {approved:true, fraud_score:0}.
+var fallbackBody = responseBody[0]
+
+func buildResponses() [index.K + 1][]byte {
+	var bodies [index.K + 1][]byte
+	for n := 0; n <= index.K; n++ {
+		score := float64(n) / float64(index.K)
+		b, err := json.Marshal(response{Approved: score < index.Threshold, FraudScore: score})
+		if err != nil {
+			panic(err) // a bool+float struct cannot fail to marshal
+		}
+		bodies[n] = append(b, '\n')
+	}
+	return bodies
+}
+
+// contentTypeJSON is assigned straight into the response header map (instead of
+// Header().Set) to avoid the one-element slice Set allocates per call.
+var contentTypeJSON = []string{"application/json"}
+
+// bufPool reuses request-body buffers; payloadPool reuses decoded payloads. Both
+// keep the request path allocation-light so the heap stays flat: with GOGC=off the
+// GOMEMLIMIT pacer then never arms, removing the GC/CFS-throttle p99 stalls.
+var bufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
+var payloadPool = sync.Pool{New: func() any { return new(vectorize.Payload) }}
+
+// putPayload zeroes the payload (so a later Unmarshal can't inherit stale fields)
+// while keeping the KnownMerchants backing array, which json.Unmarshal reuses.
+func putPayload(p *vectorize.Payload) {
+	km := p.Customer.KnownMerchants[:0]
+	*p = vectorize.Payload{}
+	p.Customer.KnownMerchants = km
+	payloadPool.Put(p)
+}
 
 func (s *server) handleReady(w http.ResponseWriter, _ *http.Request) {
 	if s.ready.Load() {
@@ -52,30 +94,38 @@ func (s *server) handleScore(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			log.Printf("recovered in handleScore: %v", rec)
-			writeJSON(w, fallback)
+			writeBody(w, fallbackBody)
 		}
 	}()
 
-	var p vectorize.Payload
-	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
-		writeJSON(w, fallback)
+	buf := bufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer bufPool.Put(buf)
+	if _, err := buf.ReadFrom(r.Body); err != nil {
+		writeBody(w, fallbackBody)
+		return
+	}
+
+	p := payloadPool.Get().(*vectorize.Payload)
+	defer putPayload(p)
+	if err := json.Unmarshal(buf.Bytes(), p); err != nil {
+		writeBody(w, fallbackBody)
 		return
 	}
 
 	ix := s.ix.Load()
 	if ix == nil {
-		writeJSON(w, fallback)
+		writeBody(w, fallbackBody)
 		return
 	}
 
-	score := ix.Score(s.vec.Vectorize(&p))
-	writeJSON(w, response{Approved: score < index.Threshold, FraudScore: score})
+	writeBody(w, responseBody[ix.ScoreCount(s.vec.Vectorize(p))])
 }
 
-func writeJSON(w http.ResponseWriter, resp response) {
-	w.Header().Set("Content-Type", "application/json")
+func writeBody(w http.ResponseWriter, body []byte) {
+	w.Header()["Content-Type"] = contentTypeJSON
 	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(resp)
+	_, _ = w.Write(body)
 }
 
 // loadVectorizer builds the Vectorizer from the embedded constant files.
@@ -172,8 +222,21 @@ func main() {
 	mux.HandleFunc("POST /fraud-score", s.handleScore)
 
 	addr := getenv("ADDR", ":8080")
+	// Explicit timeouts bound the tail and protect against slow/stuck peers. The
+	// IdleTimeout sits ABOVE nginx's upstream keepalive idle so nginx recycles
+	// pooled connections, never the api mid-flight (a premature api-side close
+	// forces nginx to reconnect, adding latency).
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadTimeout:       2 * time.Second,
+		ReadHeaderTimeout: 1 * time.Second,
+		WriteTimeout:      2 * time.Second,
+		IdleTimeout:       65 * time.Second,
+		MaxHeaderBytes:    1 << 14,
+	}
 	log.Printf("listening on %s", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
+	if err := srv.ListenAndServe(); err != nil {
 		log.Fatalf("server: %v", err)
 	}
 }
