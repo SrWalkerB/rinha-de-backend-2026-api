@@ -31,7 +31,10 @@ x-api: &api
   deploy:
     resources:
       limits:
-        cpus: "0.45"
+        # Sweep (2026-06-02): LB L4 starva <0.20 (joelho); api recebe (1-lb)/2. Config
+        # escolhido = lb 0.25 / api 0.375x2 (lb folgado acima do joelho, api 0.375>0.35
+        # do nginx). lb0.10/api0.45 = STARVADO (p99 ~156ms) — não use.
+        cpus: "0.375"
         memory: "155MB"
 
 services:
@@ -61,7 +64,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.10"
+          cpus: "0.25"
           memory: "32MB"
 
 networks:

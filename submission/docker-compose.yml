@@ -14,8 +14,9 @@ name: rinha-fraud
 # ============================================================================
 
 x-api: &api
-  # IMAGEM NOVA (3.0) com o binário /app/lb embutido — PUBLICAR antes (publish.ps1).
-  image: srwalkerb/rinha-fraud:3.0
+  # IMAGEM 4.0 = centroid-SIMD (int16 SoA cell-selection) + /app/lb embutido.
+  # PUBLICAR antes do push: publish.ps1 -User srwalkerb -Tag 4.0  (ainda não publicada).
+  image: srwalkerb/rinha-fraud:4.0
   pull_policy: always
   environment:
     ADDR: ":8080"
@@ -29,10 +30,11 @@ x-api: &api
   deploy:
     resources:
       limits:
-        # nginx (L7) precisava de ~0.30 CPU pra não se auto-throttlar (U-curve). O LB
-        # próprio é L4 (splice) — sobrevive em 0.10 → libera 0.20 pras APIs: 0.45x2 +
-        # lb 0.10 = 1.00 (local: lb@0.10 deu p99 87ms vs nginx@0.10 1142ms = não starva).
-        cpus: "0.45"
+        # CPU sweep (2026-06-02, app centroid-SIMD): o LB L4 STARVA <0.20 (joelho) —
+        # lb0.10 deu p99 156ms/final 3354 (= regressão da 3.0). Em lb>=0.20 o p99
+        # colapsa. Config: lb 0.25 / api 0.375x2 = 1.00 (lb folgado acima do joelho
+        # p/ slack do CFS do Mac; api 0.375 > 0.35 do nginx, alimenta o scoring).
+        cpus: "0.375"
         memory: "155MB"
 
 services:
@@ -44,9 +46,10 @@ services:
 
   # LB próprio (L4 splice) no lugar do nginx — mesma imagem, entrypoint /app/lb.
   # Satisfaz "≥1 load balancer + ≥2 instâncias" (é um LB, só não-nginx). Mais leve
-  # que nginx → roda em 0.10 e devolve CPU pras APIs (CPU-bound).
+  # que nginx (segura em 0.25 vs ~0.30 do nginx; STARVA <0.20 — joelho medido).
+  # Balance api1/api2 ok (skew ~1.0x sob k6: RR-por-conexão equilibra com muitas VUs).
   lb:
-    image: srwalkerb/rinha-fraud:3.0
+    image: srwalkerb/rinha-fraud:4.0
     pull_policy: always
     entrypoint: ["/app/lb"]
     environment:
@@ -62,7 +65,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.10"
+          cpus: "0.25"
           memory: "32MB"
 
 networks:
