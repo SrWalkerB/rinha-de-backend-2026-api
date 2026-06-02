@@ -1,9 +1,7 @@
-// Command buildindex constructs the IVF search index offline — at image-build
-// time, with the full machine (no CPU cap) — and writes it to a binary file.
-// At startup the API loads that file instead of running k-means under the
-// runtime cap, which makes /ready fast and lets nlist be large (smaller cells
-// => faster query => lower p99). See
-// docs/performance/05-preprocessamento-no-build.md.
+// Command buildindex constructs the partitioned search index offline — at
+// image-build time, with the full machine (no CPU cap) — and writes it to a
+// binary file. At startup the API just loads that file, so /ready is fast and
+// the runtime never pays the build cost under the CPU cap.
 package main
 
 import (
@@ -13,7 +11,7 @@ import (
 	"time"
 
 	"rinha-fraud/internal/dataset"
-	"rinha-fraud/internal/knn"
+	"rinha-fraud/internal/index"
 )
 
 func env(key, def string) string {
@@ -36,26 +34,16 @@ func main() {
 	ref := env("REFERENCES_PATH", "./resources/references.json.gz")
 	out := env("INDEX_OUT", "./resources/index.bin")
 	capHint := envi("REFERENCES_CAPACITY", 3_000_000)
-	cfg := knn.BuildConfig{
-		Mode:   "ivf",
-		NList:  envi("KNN_NLIST", 4096),
-		NProbe: envi("KNN_NPROBE", 8),
-		Iters:  envi("KNN_KMEANS_ITERS", 8),
-	}
+	nlist := envi("INDEX_NLIST", index.DefaultNList)
+	iters := envi("INDEX_KMEANS_ITERS", index.DefaultKMeansIters)
 
-	log.Printf("buildindex: loading references from %s ...", ref)
+	log.Printf("buildindex: loading + IVF-partitioning references from %s (nlist=%d iters=%d) ...", ref, nlist, iters)
 	t0 := time.Now()
-	ix, err := dataset.Load(ref, capHint)
+	ix, err := dataset.Load(ref, capHint, nlist, iters)
 	if err != nil {
 		log.Fatalf("load references: %v", err)
 	}
-	log.Printf("loaded %d vectors in %s", ix.Len(), time.Since(t0))
-
-	log.Printf("building ivf index (nlist=%d nprobe=%d iters=%d) ...",
-		cfg.NList, cfg.NProbe, cfg.Iters)
-	t1 := time.Now()
-	ix.Build(cfg)
-	log.Printf("index built in %s", time.Since(t1))
+	log.Printf("built index over %d vectors (nlist=%d) in %s", ix.Len(), ix.NList(), time.Since(t0))
 
 	if err := ix.Save(out); err != nil {
 		log.Fatalf("save index: %v", err)

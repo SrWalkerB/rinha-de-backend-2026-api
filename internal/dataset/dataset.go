@@ -1,6 +1,6 @@
 // Package dataset loads the labeled reference vectors from references.json(.gz)
-// into a knn.Index. It decodes the JSON array as a stream so memory stays bounded
-// even though the uncompressed file is hundreds of megabytes.
+// into an index.Index. It decodes the JSON array as a stream so memory stays
+// bounded even though the uncompressed file is hundreds of megabytes.
 package dataset
 
 import (
@@ -12,18 +12,18 @@ import (
 	"os"
 	"strings"
 
-	"rinha-fraud/internal/knn"
-	"rinha-fraud/internal/vectorize"
+	"rinha-fraud/internal/index"
 )
 
 type record struct {
-	Vector [vectorize.Dims]float64 `json:"vector"`
-	Label  string                  `json:"label"`
+	Vector [index.Dims]float64 `json:"vector"`
+	Label  string              `json:"label"`
 }
 
 // Load reads the reference file at path (gzip-decoded when it ends in ".gz")
-// and returns a populated index. capacityHint pre-sizes the index.
-func Load(path string, capacityHint int) (*knn.Index, error) {
+// and returns a built, ready-to-query index. capacityHint pre-sizes the builder;
+// nlist/iters configure the per-bucket k-means (≤0 → defaults).
+func Load(path string, capacityHint, nlist, iters int) (*index.Index, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("open %s: %w", path, err)
@@ -40,7 +40,7 @@ func Load(path string, capacityHint int) (*knn.Index, error) {
 		r = gz
 	}
 
-	ix := knn.NewIndex(capacityHint)
+	b := index.NewBuilder(capacityHint, nlist, iters)
 	dec := json.NewDecoder(r)
 
 	// Opening '[' of the array.
@@ -50,9 +50,9 @@ func Load(path string, capacityHint int) (*knn.Index, error) {
 	for dec.More() {
 		var rec record
 		if err := dec.Decode(&rec); err != nil {
-			return nil, fmt.Errorf("decode record %d: %w", ix.Len(), err)
+			return nil, fmt.Errorf("decode record %d: %w", b.Len(), err)
 		}
-		ix.Add(rec.Vector, rec.Label == "fraud")
+		b.Add(rec.Vector, rec.Label == "fraud")
 	}
-	return ix, nil
+	return b.Build(), nil
 }

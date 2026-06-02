@@ -18,26 +18,17 @@ import (
 	_ "net/http/pprof"
 
 	"rinha-fraud/internal/dataset"
-	"rinha-fraud/internal/knn"
-	"rinha-fraud/internal/model"
+	"rinha-fraud/internal/index"
 	"rinha-fraud/internal/vectorize"
 )
 
-//go:embed resources/normalization.json resources/mcc_risk.json resources/model.json
+//go:embed resources/normalization.json resources/mcc_risk.json
 var resourcesFS embed.FS
 
 type server struct {
 	vec   *vectorize.Vectorizer
-	sc    atomic.Pointer[scorer]
+	ix    atomic.Pointer[index.Index]
 	ready atomic.Bool
-}
-
-// scorer is the pluggable classifier behind POST /fraud-score: the KNN index
-// (Caminho A, SCORER=knn) or the trained GBDT (Caminho C, SCORER=model). A
-// transaction is approved when score(vec) < thr.
-type scorer struct {
-	score func([vectorize.Dims]float64) float64
-	thr   float64
 }
 
 type response struct {
@@ -71,14 +62,14 @@ func (s *server) handleScore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sc := s.sc.Load()
-	if sc == nil {
+	ix := s.ix.Load()
+	if ix == nil {
 		writeJSON(w, fallback)
 		return
 	}
 
-	score := sc.score(s.vec.Vectorize(&p))
-	writeJSON(w, response{Approved: score < sc.thr, FraudScore: score})
+	score := ix.Score(s.vec.Vectorize(&p))
+	writeJSON(w, response{Approved: score < index.Threshold, FraudScore: score})
 }
 
 func writeJSON(w http.ResponseWriter, resp response) {
@@ -89,42 +80,15 @@ func writeJSON(w http.ResponseWriter, resp response) {
 
 // loadVectorizer builds the Vectorizer from the embedded constant files.
 func loadVectorizer() (*vectorize.Vectorizer, error) {
-	var nf struct {
-		MaxAmount            float64 `json:"max_amount"`
-		MaxInstallments      float64 `json:"max_installments"`
-		AmountVsAvgRatio     float64 `json:"amount_vs_avg_ratio"`
-		MaxMinutes           float64 `json:"max_minutes"`
-		MaxKm                float64 `json:"max_km"`
-		MaxTxCount24h        float64 `json:"max_tx_count_24h"`
-		MaxMerchantAvgAmount float64 `json:"max_merchant_avg_amount"`
-	}
 	nb, err := resourcesFS.ReadFile("resources/normalization.json")
 	if err != nil {
 		return nil, err
 	}
-	if err := json.Unmarshal(nb, &nf); err != nil {
-		return nil, err
-	}
-
 	mb, err := resourcesFS.ReadFile("resources/mcc_risk.json")
 	if err != nil {
 		return nil, err
 	}
-	mcc := map[string]float64{}
-	if err := json.Unmarshal(mb, &mcc); err != nil {
-		return nil, err
-	}
-
-	norm := vectorize.Norm{
-		MaxAmount:            nf.MaxAmount,
-		MaxInstallments:      nf.MaxInstallments,
-		AmountVsAvgRatio:     nf.AmountVsAvgRatio,
-		MaxMinutes:           nf.MaxMinutes,
-		MaxKm:                nf.MaxKm,
-		MaxTxCount24h:        nf.MaxTxCount24h,
-		MaxMerchantAvgAmount: nf.MaxMerchantAvgAmount,
-	}
-	return vectorize.New(norm, mcc), nil
+	return vectorize.Parse(nb, mb)
 }
 
 func getenv(key, def string) string {
@@ -152,71 +116,51 @@ func main() {
 
 	refPath := getenv("REFERENCES_PATH", "./resources/references.json.gz")
 	capHint := atoiEnv("REFERENCES_CAPACITY", 3_000_000)
-	scorerKind := getenv("SCORER", "knn")
-	go func() {
-		// Caminho C: trained GBDT. No dataset/index — load the embedded model.json
-		// (a few hundred KB) and score by walking ~100 small trees. Sub-ms, tiny RAM.
-		if scorerKind == "model" {
-			b, err := resourcesFS.ReadFile("resources/model.json")
-			if err != nil {
-				log.Fatalf("read model: %v", err)
-			}
-			mdl, err := model.LoadModel(b)
-			if err != nil {
-				log.Fatalf("load model: %v", err)
-			}
-			s.sc.Store(&scorer{score: mdl.Score, thr: mdl.Tau()})
-			s.ready.Store(true)
-			log.Printf("ready: GBDT model loaded (tau=%.3f)", mdl.Tau())
-			return
-		}
+	nprobe := atoiEnv("INDEX_NPROBE", 8)    // cells scanned per bucket per query
+	maxScan := atoiEnv("INDEX_MAX_SCAN", 0) // 0 = unlimited; tail guardrail
 
-		// SCORER=knn (default). Fast path: a pre-built index baked at image-build
-		// time (step 05). Load it and skip k-means. KNN_NPROBE retunes it.
+	tune := func(ix *index.Index) {
+		ix.SetNProbe(nprobe)
+		ix.SetMaxScan(maxScan)
+	}
+
+	go func() {
+		// Fast path: an IVF index baked at image-build time. Load it and be ready
+		// in tens of ms.
 		if path := getenv("INDEX_PATH", ""); path != "" {
 			t0 := time.Now()
-			ix, err := knn.LoadIndex(path)
+			ix, err := index.LoadIndex(path)
 			if err == nil {
-				ix.SetNProbe(atoiEnv("KNN_NPROBE", 0)) // 0 => keep the baked value
-				s.sc.Store(&scorer{score: ix.Score, thr: knn.Threshold})
+				tune(ix)
+				s.ix.Store(ix)
 				s.ready.Store(true)
-				log.Printf("ready: loaded prebuilt index %s (%d vectors) in %s",
-					path, ix.Len(), time.Since(t0))
+				log.Printf("ready: loaded prebuilt index %s (%d vectors, nlist=%d nprobe=%d) in %s",
+					path, ix.Len(), ix.NList(), nprobe, time.Since(t0))
 				return
 			}
 			log.Printf("prebuilt index %s unavailable (%v); building from references", path, err)
 		}
 
-		// Fallback: load the dataset and build the index at startup.
-		log.Printf("loading references from %s ...", refPath)
-		ix, err := dataset.Load(refPath, capHint)
+		// Fallback: build the index from the dataset at startup.
+		nlist := atoiEnv("INDEX_NLIST", index.DefaultNList)
+		iters := atoiEnv("INDEX_KMEANS_ITERS", index.DefaultKMeansIters)
+		log.Printf("loading references from %s (nlist=%d) ...", refPath, nlist)
+		t0 := time.Now()
+		ix, err := dataset.Load(refPath, capHint, nlist, iters)
 		if err != nil {
 			log.Fatalf("load references: %v", err)
 		}
-
-		cfg := knn.BuildConfig{
-			Mode:   getenv("KNN_INDEX", "ivf"),
-			NList:  atoiEnv("KNN_NLIST", 256),
-			NProbe: atoiEnv("KNN_NPROBE", 8),
-			Iters:  atoiEnv("KNN_KMEANS_ITERS", 8),
-		}
-		log.Printf("building %q index over %d vectors (nlist=%d nprobe=%d) ...",
-			cfg.Mode, ix.Len(), cfg.NList, cfg.NProbe)
-		t0 := time.Now()
-		ix.Build(cfg)
-		log.Printf("index built in %s", time.Since(t0))
-
-		s.sc.Store(&scorer{score: ix.Score, thr: knn.Threshold})
+		tune(ix)
+		s.ix.Store(ix)
 		s.ready.Store(true)
-		log.Printf("ready: %d reference vectors loaded", ix.Len())
+		log.Printf("ready: built index over %d reference vectors in %s", ix.Len(), time.Since(t0))
 	}()
 
 	// Optional pprof debug server on a SEPARATE port, off unless PPROF_ADDR is
-	// set. Passing nil serves http.DefaultServeMux, where net/http/pprof
-	// registered its handlers. Never expose this on the API port.
+	// set. Never expose this on the API port.
 	if pprofAddr := getenv("PPROF_ADDR", ""); pprofAddr != "" {
 		go func() {
-			log.Printf("pprof listening on %s (e.g. http://%s/debug/pprof/)", pprofAddr, pprofAddr)
+			log.Printf("pprof listening on %s", pprofAddr)
 			if err := http.ListenAndServe(pprofAddr, nil); err != nil {
 				log.Printf("pprof server: %v", err)
 			}
@@ -227,7 +171,7 @@ func main() {
 	mux.HandleFunc("GET /ready", s.handleReady)
 	mux.HandleFunc("POST /fraud-score", s.handleScore)
 
-	addr := getenv("ADDR", ":9999")
+	addr := getenv("ADDR", ":8080")
 	log.Printf("listening on %s", addr)
 	if err := http.ListenAndServe(addr, mux); err != nil {
 		log.Fatalf("server: %v", err)

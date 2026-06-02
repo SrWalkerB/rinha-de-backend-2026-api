@@ -1,7 +1,10 @@
 .git
 *.log
+*.exe
 rinha-fraud
-rinha-fraud.exe
 docs
+train
+# Built fresh inside the image from references.json.gz — don't ship the host copy.
+resources/index.bin
 resources/example-payloads.json
 resources/example-references.json

@@ -8,21 +8,24 @@ name: rinha-fraud
 #   - A imagem precisa estar PUBLICAMENTE disponível (Docker Hub / ghcr).
 #   - Soma dos limites de TODOS os serviços <= 1 CPU e 350 MB.
 #
-# >>> TROQUE `srwalkerb/rinha-fraud:1.0` pela SUA imagem pública (publish.ps1). <<<
-# A imagem já carrega o index.bin (índice IVF pré-construído) — sobe sem dataset.
+# >>> TROQUE `srwalkerb/rinha-fraud:TAG` pela SUA imagem pública (publish.ps1).
+# Use uma TAG NOVA a cada push pra evitar cache da engine (pull_policy: always
+# garante pull fresco). A imagem já carrega o index.bin (IVF pré-construído).
 # ============================================================================
 
 x-api: &api
-  image: srwalkerb/rinha-fraud:1.0
+  image: srwalkerb/rinha-fraud:2.0
+  pull_policy: always
   environment:
     ADDR: ":8080"
     GOMAXPROCS: "1"
     GOMEMLIMIT: "150MiB"
-    # GC só dispara perto do limite de memória (live set ~54MB << 150MiB).
+    # GC só dispara perto do limite de memória (live set ~88MB << 150MiB).
     GOGC: "off"
-    # Células IVF varridas por query. Retuna o índice pré-construído SEM rebuild
-    # (maior = mais recall, mais lento). Medido: nprobe=12 -> p99 ~484ms.
-    KNN_NPROBE: "12"
+    # Células IVF varridas por bucket/query. Maior = mais recall (melhor
+    # detection_score), mais CPU. Sintonizar via testes de prévia: subir até o
+    # p99 no Mac Mini se aproximar de 1ms. Sem rebuild (knob de runtime).
+    INDEX_NPROBE: "16"
   networks:
     - app
   deploy:

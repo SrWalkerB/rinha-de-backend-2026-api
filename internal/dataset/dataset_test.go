@@ -52,7 +52,7 @@ func TestLoadPlainJSON(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ix, err := Load(path, 8)
+	ix, err := Load(path, 8, 0, 0)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -83,7 +83,7 @@ func TestLoadGzip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ix, err := Load(path, 8)
+	ix, err := Load(path, 8, 0, 0)
 	if err != nil {
 		t.Fatalf("Load gz: %v", err)
 	}
@@ -101,7 +101,7 @@ func TestLoadRealExampleReferences(t *testing.T) {
 	if _, err := os.Stat(path); err != nil {
 		t.Skipf("sample not present: %v", err)
 	}
-	ix, err := Load(path, 128)
+	ix, err := Load(path, 128, 0, 0)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}

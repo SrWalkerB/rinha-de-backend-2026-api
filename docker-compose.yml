@@ -1,28 +1,31 @@
 name: rinha-fraud
 
 # ============================================================================
-# docker-compose.yml da BRANCH `submission`.
+# docker-compose.yml de DESENVOLVIMENTO (build local).
 #
-# Regras (docs/br/ARQUITETURA.md + SUBMISSAO.md):
-#   - SEM `build:` aqui — a branch submission NÃO pode ter código-fonte.
-#   - A imagem precisa estar PUBLICAMENTE disponível (Docker Hub / ghcr).
-#   - Soma dos limites de TODOS os serviços <= 1 CPU e 350 MB.
+# Builda a imagem a partir do código-fonte (Dockerfile) — o `buildindex` gera o
+# index.bin embutido. Usado pelo run-test.ps1 para o teste de carga k6 local.
+# O compose da SUBMISSÃO (sem build, por imagem pública) está em ./submission/.
 #
-# >>> TROQUE `srwalkerb/rinha-fraud:1.0` pela SUA imagem pública (publish.ps1). <<<
-# A imagem já carrega o index.bin (índice IVF pré-construído) — sobe sem dataset.
+# Soma dos limites de TODOS os serviços <= 1 CPU e 350 MB (regra da Rinha).
 # ============================================================================
 
 x-api: &api
-  image: srwalkerb/rinha-fraud:1.0
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: srwalkerb/rinha-fraud:dev
   environment:
     ADDR: ":8080"
     GOMAXPROCS: "1"
     GOMEMLIMIT: "150MiB"
-    # GC só dispara perto do limite de memória (live set ~54MB << 150MiB).
+    # GC só dispara perto do limite de memória (live set ~88MB << 150MiB).
     GOGC: "off"
-    # Células IVF varridas por query. Retuna o índice pré-construído SEM rebuild
-    # (maior = mais recall, mais lento). Medido: nprobe=12 -> p99 ~484ms.
-    KNN_NPROBE: "12"
+    # Busca 5-NN por IVF (k-means contíguo por bucket). Knob sintonizável SEM
+    # rebuild: INDEX_NPROBE = células varridas por bucket/query (maior = mais
+    # recall/det, mais lento). INDEX_MAX_SCAN = teto de linhas/query (guarda de cauda).
+    INDEX_NPROBE: "16"
+    INDEX_MAX_SCAN: "0"
   networks:
     - app
   deploy:

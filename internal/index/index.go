@@ -1,0 +1,377 @@
+// Package index holds the 3M labeled reference vectors and answers a 5-nearest-
+// neighbors fraud query in microseconds, fast enough to sustain the load test.
+//
+// Why this shape. A full float64 brute scan reproduces the official ground truth
+// (0 failures) but costs ~870ms p99. Exact spatial pruning does NOT help here:
+// the data is "spread" (the 5th neighbor sits ~0.5 away in ~10 effective dims),
+// so a k-d tree still visits a large fraction of the data, and — worse — its
+// reordered layout makes every visit a cache miss, which collapses under
+// concurrent load. The decision, though, is only a majority vote over 5
+// neighbors, which is robust to small perturbations of the neighbor set. So we
+// use an approximate index that scans FEW rows CONTIGUOUSLY:
+//
+//   - 16 hard buckets keyed by the four ≥1.0-gap dims (is_online, card_present,
+//     unknown_merchant, last_transaction-null). Each bucket is a contiguous range.
+//   - Within each bucket, k-means partitions the rows into `nlist` cells; rows are
+//     stored contiguously by cell (CSR offsets). A query computes its distance to
+//     the bucket's centroids, scans the `nprobe` nearest cells (a handful of
+//     contiguous, prefetch-friendly rows), and — only when the running 5th
+//     distance could still be beaten across a bucket boundary — probes the
+//     relevant neighbouring buckets.
+//
+// Storage is uint16 on the data's native 4-decimal grid; distance is float64 with
+// the query un-quantized, so each scanned candidate's distance is exact. nprobe is
+// a runtime knob (recall vs latency) retunable without a rebuild.
+package index
+
+import (
+	"math"
+
+	"rinha-fraud/internal/vectorize"
+)
+
+// Dims is the vector dimensionality (kept identical to the vectorizer).
+const Dims = vectorize.Dims
+
+// K is the number of nearest neighbors used to score a transaction.
+const K = 5
+
+// Threshold: a transaction is approved when fraud_score < Threshold.
+const Threshold = 0.6
+
+// numBuckets = 2^4: is_online, card_present, unknown_merchant, null flag.
+const numBuckets = 16
+
+// maxProbe caps nprobe so the per-query probe buffer lives on the stack
+// (zero-allocation Score). nprobe is clamped to this.
+const maxProbe = 64
+
+// --- uint16 quantization (native 4-decimal grid) -------------------------
+
+const maxBucketVal = 10001 // quantize(1) = round(1*10000)+1
+
+// quantize maps a normalized dimension to a uint16 on the data's native grid.
+//
+//	-1 (sentinel, no last_transaction) -> 0
+//	[0, 1]                             -> [1, 10001]
+func quantize(v float64) uint16 {
+	if v < 0 {
+		return 0
+	}
+	if v > 1 {
+		v = 1
+	}
+	return uint16(math.Round(v*10000)) + 1
+}
+
+// dequantTab maps a stored bucket to its exact float64 value, precomputed once so
+// the hot distance loop does a table lookup instead of a per-element division.
+var dequantTab = func() [maxBucketVal + 1]float64 {
+	var t [maxBucketVal + 1]float64
+	t[0] = -1
+	for u := 1; u <= maxBucketVal; u++ {
+		t[u] = float64(u-1) / 10000
+	}
+	return t
+}()
+
+func dequant(u uint16) float64 { return dequantTab[u] }
+
+// bucketOf returns the hard-bucket index for a vector: the four dims where any
+// mismatch costs ≥1.0 in squared distance.
+func bucketOf(v *[Dims]float64) int {
+	b := 0
+	if v[9] >= 0.5 { // is_online
+		b |= 8
+	}
+	if v[10] >= 0.5 { // card_present
+		b |= 4
+	}
+	if v[11] >= 0.5 { // unknown_merchant
+		b |= 2
+	}
+	if v[5] < 0 { // last_transaction null (dims 5,6 are −1 together)
+		b |= 1
+	}
+	return b
+}
+
+// bucketPenalty is a lower bound on the squared distance from q to ANY row in
+// hard bucket `target`: the forced contribution of the four key dims. Used to
+// skip whole buckets cheaply during the cross-bucket pass.
+func bucketPenalty(q *[Dims]float64, target int) float64 {
+	var p float64
+	on := 0
+	if q[9] >= 0.5 {
+		on = 1
+	}
+	if on != (target>>3)&1 {
+		p += 1
+	}
+	cp := 0
+	if q[10] >= 0.5 {
+		cp = 1
+	}
+	if cp != (target>>2)&1 {
+		p += 1
+	}
+	um := 0
+	if q[11] >= 0.5 {
+		um = 1
+	}
+	if um != (target>>1)&1 {
+		p += 1
+	}
+	qnull := 0
+	if q[5] < 0 {
+		qnull = 1
+	}
+	if tnull := target & 1; qnull != tnull {
+		if qnull == 1 {
+			p += 2
+		} else {
+			p += (q[5]+1)*(q[5]+1) + (q[6]+1)*(q[6]+1)
+		}
+	}
+	return p
+}
+
+// --- the index -----------------------------------------------------------
+
+// Index holds the reference vectors reordered into (bucket, cell) order, a fraud
+// bitset, the per-bucket k-means centroids, and CSR cell offsets. Build it with a
+// Builder (or LoadIndex); Score is then safe for concurrent callers.
+type Index struct {
+	data      []uint16  // n*Dims quantized, reordered by (bucket, cell)
+	fraud     []uint64  // fraud bitset over reordered rows
+	n         int
+	nlist     int       // k-means cells per bucket
+	centroids []float64 // numBuckets*nlist*Dims, in the dequantized value space
+	cellStart []int32   // CSR: rows of global cell i = [cellStart[i], cellStart[i+1]); len numBuckets*nlist+1
+
+	bucketStart [17]int32 // rows of bucket b = [bucketStart[b], bucketStart[b+1])
+
+	nprobe  int // cells scanned per bucket per query (runtime knob)
+	maxScan int // per-query row cap (0 = unlimited); tail guardrail
+}
+
+// Len reports how many reference vectors are stored.
+func (ix *Index) Len() int { return ix.n }
+
+// NList reports the number of k-means cells per bucket.
+func (ix *Index) NList() int { return ix.nlist }
+
+// SetNProbe sets how many cells are scanned per probed bucket (clamped to
+// [1, min(nlist, maxProbe)]). ≤0 leaves it unchanged.
+func (ix *Index) SetNProbe(np int) {
+	if np <= 0 {
+		return
+	}
+	if np > ix.nlist {
+		np = ix.nlist
+	}
+	if np > maxProbe {
+		np = maxProbe
+	}
+	ix.nprobe = np
+}
+
+// SetMaxScan sets the per-query row-scan cap (≤0 means unlimited).
+func (ix *Index) SetMaxScan(n int) {
+	if n < 0 {
+		n = 0
+	}
+	ix.maxScan = n
+}
+
+func (ix *Index) isFraud(i int) bool {
+	return ix.fraud[i>>6]&(1<<uint(i&63)) != 0
+}
+
+// dist2 returns the squared euclidean distance between the un-quantized query q
+// and stored row `row`, summing all Dims.
+func (ix *Index) dist2(q *[Dims]float64, row int) float64 {
+	off := row * Dims
+	data := ix.data
+	var d float64
+	for i := 0; i < Dims; i++ {
+		diff := q[i] - dequantTab[data[off+i]]
+		d += diff * diff
+	}
+	return d
+}
+
+// centroidDist returns the squared distance from q to centroid `cell` (a global
+// cell index). Centroids carry their bucket's discrete-dim values, so this
+// already includes the bucket penalty for cells in other buckets.
+func (ix *Index) centroidDist(q *[Dims]float64, cell int) float64 {
+	base := cell * Dims
+	c := ix.centroids
+	var d float64
+	for i := 0; i < Dims; i++ {
+		diff := q[i] - c[base+i]
+		d += diff * diff
+	}
+	return d
+}
+
+// Score returns the fraud fraction among the (approximately) K nearest reference
+// vectors.
+func (ix *Index) Score(query [Dims]float64) float64 {
+	if ix.n == 0 {
+		return 0
+	}
+	tk, _ := ix.searchTopK(&query)
+	return tk.fraudScore()
+}
+
+// ScoreScan is like Score but also returns the number of reference rows visited.
+// Diagnostic only.
+func (ix *Index) ScoreScan(query [Dims]float64) (float64, int) {
+	if ix.n == 0 {
+		return 0, 0
+	}
+	tk, scanned := ix.searchTopK(&query)
+	return tk.fraudScore(), scanned
+}
+
+func (ix *Index) searchTopK(q *[Dims]float64) (topK, int) {
+	tk := newTopK()
+	scanned := 0
+	b0 := bucketOf(q)
+
+	ix.probeBucket(q, b0, &tk, &scanned)
+
+	// Cross-bucket: only buckets whose forced penalty could still beat the
+	// running 5th distance. With a populated own bucket this rarely fires.
+	for b := 0; b < numBuckets; b++ {
+		if b == b0 {
+			continue
+		}
+		if ix.maxScan > 0 && scanned >= ix.maxScan {
+			break
+		}
+		if bucketPenalty(q, b) >= tk.worst() {
+			continue
+		}
+		ix.probeBucket(q, b, &tk, &scanned)
+	}
+	return tk, scanned
+}
+
+// probeBucket scans the nprobe nearest cells of bucket b. Cell selection touches
+// only the nlist centroids (contiguous); the chosen cells are contiguous row
+// runs, so the candidate scan is prefetch-friendly.
+func (ix *Index) probeBucket(q *[Dims]float64, b int, tk *topK, scanned *int) {
+	base := b * ix.nlist
+	np := ix.nprobe
+	if np > ix.nlist {
+		np = ix.nlist
+	}
+	if np > maxProbe {
+		np = maxProbe
+	}
+	if np < 1 {
+		np = 1
+	}
+
+	// Select the np nearest centroids into stack arrays (no allocation).
+	var pd [maxProbe]float64
+	var pc [maxProbe]int32
+	for i := 0; i < np; i++ {
+		pd[i] = math.MaxFloat64
+	}
+	for c := 0; c < ix.nlist; c++ {
+		d := ix.centroidDist(q, base+c)
+		if d >= pd[np-1] {
+			continue
+		}
+		pos := np - 1
+		for pos > 0 && pd[pos-1] > d {
+			pd[pos] = pd[pos-1]
+			pc[pos] = pc[pos-1]
+			pos--
+		}
+		pd[pos] = d
+		pc[pos] = int32(base + c)
+	}
+
+	for i := 0; i < np; i++ {
+		if pd[i] == math.MaxFloat64 {
+			break // fewer non-empty candidates than np
+		}
+		cell := int(pc[i])
+		lo, hi := ix.cellStart[cell], ix.cellStart[cell+1]
+		for r := lo; r < hi; r++ {
+			tk.consider(ix.dist2(q, int(r)), ix.isFraud(int(r)))
+		}
+		*scanned += int(hi - lo)
+		if ix.maxScan > 0 && *scanned >= ix.maxScan {
+			return
+		}
+	}
+}
+
+// BruteScore is the exact O(n) reference: it scans every stored row. The offline
+// harness uses it as the ground-truth oracle. Not on the serving path.
+func (ix *Index) BruteScore(query [Dims]float64) float64 {
+	s, _ := ix.BruteDebug(query)
+	return s
+}
+
+// BruteDebug returns the exact fraud score AND the squared distance to the K-th
+// nearest reference (the search radius). Diagnostic only.
+func (ix *Index) BruteDebug(query [Dims]float64) (score, kthDist2 float64) {
+	if ix.n == 0 {
+		return 0, 0
+	}
+	tk := newTopK()
+	for r := 0; r < ix.n; r++ {
+		tk.consider(ix.dist2(&query, r), ix.isFraud(r))
+	}
+	return tk.fraudScore(), tk.worst()
+}
+
+// --- topK: sorted buffer of the K nearest seen so far --------------------
+
+type topK struct {
+	dist  [K]float64
+	fraud [K]bool
+}
+
+func newTopK() topK {
+	var t topK
+	for i := range t.dist {
+		t.dist[i] = math.MaxFloat64
+	}
+	return t
+}
+
+// worst is the distance of the current K-th nearest.
+func (t *topK) worst() float64 { return t.dist[K-1] }
+
+// consider inserts (dist, fraud) if it beats the current K-th. The strict `<`
+// (first-seen wins ties) matches the float64 ground-truth oracle.
+func (t *topK) consider(dist float64, fraud bool) {
+	if dist >= t.dist[K-1] {
+		return
+	}
+	pos := K - 1
+	for pos > 0 && t.dist[pos-1] > dist {
+		t.dist[pos] = t.dist[pos-1]
+		t.fraud[pos] = t.fraud[pos-1]
+		pos--
+	}
+	t.dist[pos] = dist
+	t.fraud[pos] = fraud
+}
+
+func (t *topK) fraudScore() float64 {
+	n := 0
+	for i := 0; i < K; i++ {
+		if t.fraud[i] {
+			n++
+		}
+	}
+	return float64(n) / float64(K)
+}

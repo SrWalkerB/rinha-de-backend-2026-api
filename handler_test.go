@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"rinha-fraud/internal/knn"
+	"rinha-fraud/internal/index"
 	"rinha-fraud/internal/vectorize"
 )
 
@@ -39,12 +39,12 @@ func serverWithFraudNeighbors(t *testing.T) *server {
 		t.Fatal(err)
 	}
 	fv := vec.Vectorize(&p)
-	ix := knn.NewIndex(8)
+	b := index.NewBuilder(8, 1, 1)
 	for i := 0; i < 5; i++ {
-		ix.Add(fv, true)
+		b.Add(fv, true)
 	}
 	s := &server{vec: vec}
-	s.sc.Store(&scorer{score: ix.Score, thr: knn.Threshold})
+	s.ix.Store(b.Build())
 	s.ready.Store(true)
 	return s
 }
