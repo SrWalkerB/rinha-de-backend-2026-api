@@ -6,94 +6,110 @@ a competição Rinha de Backend 2026.
 ## Objetivo
 
 Maximizar o `final_score` da Rinha (`p99_score + detection_score`, faixa −6000..+6000):
-1. **Atender 100% das requisições** sob carga (900 req/s) — ✅ feito (`Err=0`, zero timeout).
-2. **p99 baixo** — ✅ 387ms local (de 2002ms).
-3. **0 failures de classificação** — 🔄 em 0.33% (de 0.5%); rumo a 0.
+1. **Atender 100% das requisições** sob carga (900 req/s) — ✅ `Err=0`, sustenta a carga.
+2. **p99 baixo** — busca ~219µs/query de CPU (nprobe=16); ver caveat do p99 local abaixo.
+3. **Failures de classificação mínimas** — E=30 (0.03%) @ nprobe=16; tunável via nprobe.
 
 Meta de aprendizado do dono: usar o projeto pra **aprender performance/otimização** medindo
-cada técnica (trilha em `docs/performance/`). Princípio: **meça antes de complicar.**
+cada técnica. Princípio: **meça antes de complicar.**
 
 ## O desafio (regras essenciais)
 
 - **Endpoints (porta 9999, atrás do nginx):** `GET /ready` (200 quando carregado), `POST
-  /fraud-score` (recebe transação → `{approved, fraud_score}`).
-- **Detecção:** vetoriza payload em **14 dims** normalizadas → **5-NN** (k=5, euclidiana) sobre
-  3M vetores rotulados → `fraud_score = nº_fraudes/5`, `approved = fraud_score < 0.6`.
-- **Ground truth:** rotulado com **5-NN exato float64 brute force** (AVALIACAO.md). Cada
-  payload de teste tem `expected_approved`. **0 failures = reproduzir o 5-NN exato.**
-- **failures = FP + FN + Err** (não é só timeout!). Nosso `Err=0` → toda failure é classificação.
+  /fraud-score` (transação → `{approved, fraud_score}`).
+- **Detecção (gabarito):** vetoriza payload em **14 dims** normalizadas → **5-NN exato float64
+  brute force** sobre 3M vetores rotulados → `fraud_score = nº_fraudes/5`, `approved = score < 0.6`.
+- **failures = FP + FN + Err.** Mantemos `Err=0` → toda failure é classificação.
 - **Scoring (AVALIACAO.md):**
-  - `p99_score = 1000·log10(1000/max(p99,1))` — cap **+3000** em ≤1ms, corte **−3000** acima de 2000ms.
-  - `detection_score = 1000·log10(1/max(ε,0.001)) − 300·log10(1+E)`, `E = 1·FP+3·FN+5·Err`,
-    `ε = E/N`; corte **−3000** se `failures/N > 15%`. Teto **+3000** (E=0).
+  - `p99_score = 1000·log10(1000/max(p99,1))` — teto **+3000** em ≤1ms, corte **−3000** acima de 2000ms.
+  - `detection_score = 1000·log10(1/max(ε,0.001)) − 300·log10(1+E)`, `E = 1·FP+3·FN+5·Err`, `ε=E/N`.
+    **O componente de taxa satura em +3000 quando ε≤0.001 (E≤~54)** → daí `det = 3000 − 300·log10(1+E)`,
+    então **minimizar E é tudo.** Teto +3000 só com E=0.
   - `final = p99_score + detection_score`.
-- **KNN NÃO é obrigatório** (FAQ): qualquer classificador vale. Líderes (p99 0.37ms / 0%) usam
-  modelo treinado (ex.: xgboost), não varredura.
 
-## Restrições (o container é apertado)
+## Arquitetura (busca: IVF de células contíguas)
 
-- **Hardware de avaliação:** Mac Mini Late 2014 — **2 cores, 2.6 GHz** (Haswell, tem AVX2).
-- **Soma de TODOS os serviços ≤ 1 CPU e 350 MB.** Hoje: api1/api2 = **0.45 CPU + 155 MB** cada,
-  nginx = 0.10 + 40 MB. `GOMAXPROCS=1`, `GOMEMLIMIT=150MiB`, `GOGC=off`.
-- **Orçamento por query:** ~0.45 core a 2.6 GHz → **~1 ms de CPU/query**. Mais recall (mais
-  varredura) = mais p99. É a tensão central de qualquer melhoria.
-- **Memória:** live set ~96 MB (uint16) → ~50 MB livres. `float32` (168 MB) **não cabe**.
-- Binário estático (`CGO_ENABLED=0`, distroless). Sem dependências externas.
+A detecção (5-NN exato) é PORTÁVEL e quase resolvida; **o gargalo era latência**. 5-NN exato é
+inviável sub-ms aqui (dados "espalhados": 5ª-NN a ~0.5 euclidiano em ~10 dims → varre raio grande).
+A solução: **IVF aproximado com memória CONTÍGUA** (cache-friendly), que o voto-maioria no limiar
+0.6 tolera bem.
 
-## Como a API funciona
+1. `internal/vectorize` — payload → `[14]float64` (normalizado [0,1]; sentinela −1 nas dims 5/6
+   quando `last_transaction` é null). **Fiel ao gabarito** (float64-exato = 0 failures no diag).
+   `Parse(normJSON, mccJSON)` constrói o Vectorizer (usado por main + diag).
+2. `internal/index` — **o coração.** quantiza cada dim em **uint16** na grade nativa de 4 casas
+   (`round(v*10000)+1`; −1→0); distância **float64** com a query NÃO-quantizada vs refs dequantizadas
+   (table lookup `dequantTab`, sem divisão no hot loop). Estrutura em 2 níveis:
+   - **16 buckets duros** (`bucketOf`): bits de `is_online`(d9), `card_present`(d10),
+     `unknown_merchant`(d11) + flag-de-nulo(d5/d6). São as únicas dims com gap ≥1.0 → partição exata.
+   - **k-means por bucket** em `nlist` células, linhas **armazenadas contíguas por célula** (CSR
+     `cellStart`). Query: `bucketOf` → varre as `nprobe` células de centróide mais próximo
+     (contíguo, prefetch) + buckets vizinhos só se o `bucketPenalty` (≥1.0) admitir. Hot path
+     zero-alloc, buffers na stack (`maxProbe=64`).
+3. `internal/dataset` — `Load(path, cap, nlist, iters)` faz stream do `references.json.gz` (3M) pro
+   `index.Builder`.
+4. Índice **pré-construído no Docker build** (`cmd/buildindex` → `index.bin` embutido, ~75s k-means);
+   startup só carrega (~ms). `main.go` carrega de `INDEX_PATH`, fallback build no startup.
 
-1. `internal/vectorize` — payload → `[14]float64` (normalizado [0,1], sentinela −1 nas dims
-   5/6 quando `last_transaction` é null). **Vetorização é fiel ao gabarito (99.996%).**
-2. `internal/knn` — quantiza cada dim pra **uint16** ([0,1]→[1,65535]; −1→0), busca os 5 mais
-   próximos. Três modos via `Build`: `brute` (exato, fallback N<2048), `vptree` (exato, ensino),
-   **`ivf`** (aproximado k-means, **produção**). Distância euclidiana² em acumulador uint64.
-3. `internal/dataset` — carrega `references.json.gz` (3M vetores).
-4. Índice IVF **pré-construído no build** (`cmd/buildindex` → `index.bin` embutido na imagem);
-   no startup só carrega (~25ms). `main.go` carrega de `INDEX_PATH`, com fallback pra build no startup.
+## Estado / curva de sintonia (medido no dado real, 54.100 entradas)
 
-## Estado atual / jornada (docs/performance/README.md tem a tabela completa)
+`detection_score` é **portável**; latência varia por máquina. Sweep de `nprobe` (diag offline):
 
-| etapa | técnica | p99 | failures | final | ambiente |
-|---|---|---|---|---|---|
-| baseline | brute-force | 2002ms | 100% | −6000 | docker |
-| 03-05 | IVF + tuning + índice no build | 484ms | 0.50% | 1531 | docker (local) |
-| **rank oficial** | uint8 (Mac Mini) | 562ms | 0.503% | **1460** | Mac Mini |
-| **07 (atual)** | **quantização uint16** | 387ms | 0.33% | **1843** | docker (local) |
+| nprobe | E | failures | det_score | compute/query (dev) |
+|---|---|---|---|---|
+| 8  | 91 | 0.087% | +2185 | 122µs |
+| **16** | **31** | **0.031%** | **+2552** | **219µs** |
+| 32 | 14 | 0.011% | +2647 | 379µs |
+| 64 |  4 | 0.004% | +2790 | 840µs |
 
-`detection_score` é **portável** (independe de HW): +1216 → **+1430** com uint16. p99 varia por
-máquina (local é otimista vs Mac Mini).
+`go test ./...` verde; exatidão provada (com `nlist=1`/`nprobe=nlist` o index == brute float64).
 
 ## Aprendizados-chave (NÃO re-descobrir)
 
-- **As failures eram QUANTIZAÇÃO, não recall do IVF** (provado por `cmd/diag`, doc 07): busca
-  exata float64 = 0 failures; uint8 exato já errava 234; IVF só somava 35. uint8→uint16 cortou
-  pra 180.
-- **uint16 é o teto de precisão que cabe.** 65535 buckets ainda flipam ~144 empates de fronteira;
-  só float zera, e float32 estoura a memória. Tunar `nprobe` não passa do piso de quantização.
-- **VP-tree é mais LENTO que brute** em 14-D (maldição da dimensionalidade) — mantido só pra ensino.
-- **Early-abandon por-dimensão não pagou** (loop de 14 dims curto demais; quebra pipeline) — revertido.
-- **Caminho pro topo (0 failures + p99 sub-ms): classificador treinado** (GBDT/árvores, Go puro,
-  offline) — contorna o tradeoff precisão↔memória do KNN. Próximo grande passo se mirar 6000.
+- **Não é o Go.** Submissão Go no rank faz 0.445ms/0%/6000. Gargalo = padrão de memória + algoritmo.
+- **5-NN EXATO é inviável sub-ms aqui.** Dados espalhados (5ª-NN ~0.5) → kd-tree/brute varrem
+  250k–1.17M linhas/query (medido). Detecção exata = E=0 mas p99 catastrófico.
+- **kd-tree COLAPSA sob carga: acesso ESPALHADO** (reorder espalha linhas) → cache miss/linha
+  (~100ns) → sob concorrência thrasha o cache → k6 deu −6000 (84% timeout). Localidade de cache
+  domina o nº de linhas.
+- **IVF de células CONTÍGUAS resolve:** ~219µs/query (nprobe=16), sustenta 900 req/s (Err=0),
+  E=30. Contíguo = prefetch, fica em L2.
+- **⚠️ O p99 do k6 LOCAL é artefato da rede do Docker Desktop Windows.** Provado: nprobe=1 (29µs,
+  2% CPU) e nprobe=16 (219µs) dão p99 IDÊNTICO (~725ms). Compute a 2% de util não satura — é a VM.
+  **Pra medir p99 real → teste de prévia da Rinha (roda no Mac Mini Linux nativo).**
+- **Caminho pro 6000:** com IVF o det teto é ~+2790 (E≈4). Pra E→0 (det +3000), considerar
+  `nprobe` adaptativo: re-buscar com nprobe alto só as queries com `fraud_score` perto de 0.6
+  (fronteira), mantendo o custo médio baixo. (Não implementado.)
+
+## Restrições (container apertado)
+
+- **Mac Mini Late 2014:** 2 cores, 2.6 GHz (Haswell, AVX2). Soma de TODOS os serviços ≤ 1 CPU e 350 MB.
+- api1/api2 = 0.45 CPU + 155 MB cada; nginx = 0.10 + 40 MB. `GOMAXPROCS=1`, `GOMEMLIMIT=150MiB`, `GOGC=off`.
+- **Memória:** live set ~88 MB (uint16 data 84MB + centróides 1.8MB + bitset + CSR). Cabe folgado.
+- Binário estático (`CGO_ENABLED=0`, distroless). Sem deps.
 
 ## Arquivos-chave
 
-- `main.go` — servidor; carrega `INDEX_PATH` ou faz fallback build.
-- `internal/knn/{knn,ivf,vptree,serialize}.go` — busca + quantização uint16 + índice serializado v2.
-- `cmd/buildindex/main.go` — builda o `index.bin` offline (no Docker build, CPU cheia).
-- `cmd/diag/main.go` — **harness de diagnóstico offline** (replay do test-data, atribui failures).
-- `Dockerfile` — multi-stage; builda índice no build, embute `index.bin` (sem o `.gz` no runtime).
-- `docker-compose.yml` — stack de dev (build local). `submission/` — arquivos da branch submission.
-- `docs/performance/` — trilha didática (00-07). `TESTING.md` — runbook de carga.
+- `main.go` — servidor; `loadVectorizer` (embed) + carrega `INDEX_PATH` (fallback build); aplica
+  `INDEX_NPROBE`/`INDEX_MAX_SCAN`.
+- `internal/index/{index,build,serialize}.go` — IVF: busca (index.go), k-means + counting-sort de
+  células (build.go), formato binário v3 (serialize.go). `BruteScore`/`ScoreScan` = só diagnóstico.
+- `internal/vectorize/{vectorize,load}.go` — vetorização fiel + `Parse`.
+- `cmd/buildindex/main.go` — builda `index.bin` offline (Docker build).
+- `cmd/diag/main.go` — **harness offline:** replay das 54.100 entradas; compara IVF vs brute float64
+  (oráculo), reporta E/det + estatísticas de scan/latência. Knobs via env (`INDEX_NPROBE` etc).
+- `Dockerfile` — multi-stage; builda índice no build, embute `index.bin` (sem `.gz` no runtime).
+- `docker-compose.yml` — stack de DEV (build local, usado pelo run-test.ps1). `submission/` — branch submission.
 
 ## Comandos (Go em `C:\Program Files\Go\bin`, NÃO está no PATH)
 
 ```powershell
 $env:Path = "C:\Program Files\Go\bin;" + $env:Path
-go test ./...                       # testes (todos verdes)
-go run ./cmd/diag                   # diagnóstico offline (~8min; precisa do .gz + test-data.json)
-.\run-test.ps1 -SkipSmoke           # builda imagem local + sobe stack + k6 + nota (docker)
-.\verify-submission.ps1 -SkipSmoke  # dry-run da SUBMISSÃO: pull da imagem pública + k6
-.\publish.ps1 -User srwalkerb       # builda uint16 + push pra Docker Hub (tag 1.0)
+go test ./...                                   # testes (todos verdes)
+go run ./cmd/buildindex                          # gera resources/index.bin (~75s)
+$env:INDEX_PATH=".\resources\index.bin"; $env:INDEX_NPROBE="16"; go run ./cmd/diag   # diag offline (carrega index, rápido)
+.\run-test.ps1 -SkipSmoke                        # builda imagem local + sobe stack + k6 (p99 local = artefato Windows!)
+.\publish.ps1 -User srwalkerb                    # push pra Docker Hub
 ```
 
 ## Variáveis de ambiente
@@ -101,33 +117,26 @@ go run ./cmd/diag                   # diagnóstico offline (~8min; precisa do .g
 | Var | Default | Onde |
 |---|---|---|
 | `INDEX_PATH` | (vazio) | runtime — carrega índice pronto; senão fallback build |
-| `KNN_NPROBE` | 8 (compose: 12) | runtime — células IVF varridas/query (retuna sem rebuild) |
-| `KNN_NLIST` | 4096 (Dockerfile ARG) | build — nº de células k-means |
+| `INDEX_NPROBE` | 8 (compose: 16) | runtime — células IVF varridas/bucket/query (retuna SEM rebuild) |
+| `INDEX_NLIST` | 1024 | build — células k-means por bucket |
+| `INDEX_KMEANS_ITERS` | 10 | build — iterações do k-means |
+| `INDEX_MAX_SCAN` | 0 (ilimitado) | runtime — teto de linhas/query (guarda de cauda) |
 | `GOMAXPROCS/GOMEMLIMIT/GOGC` | 1 / 150MiB / off | compose |
 | `ADDR` | :8080 | porta da API (nginx expõe 9999) |
 | `PPROF_ADDR` | (vazio) | debug — NUNCA setar na submissão |
 
 ## Submissão (fluxo)
 
-- **2 branches:** `main` (código-fonte completo) + `submission` (só `docker-compose.yml` por
-  IMAGEM pública + `nginx.conf` + `info.json`, **sem fonte**).
-- A engine puxa do GitHub (branch submission) + Docker Hub (imagem). Repo deve ser **público**.
-- **Imagem precisa estar publicada e atualizada.** Tag é mutável: sobrescrever `1.0` mantém a
-  branch sem mudança, MAS `docker compose` por padrão (`pull_policy: missing`) pode reusar cache
-  → considerar `pull_policy: always` no compose da submission pra garantir pull fresco.
-- Teste de prévia: abrir issue em `zanfranceschi/rinha-de-backend-2026` com `rinha/test` na
-  descrição. Teste final: automático, **deadline 2026-06-05**.
-- **PENDENTE:** a imagem publicada ainda é **uint8 antiga** — re-pushar uint16 antes do teste final.
-
-## Ambiente de dev (quirks)
-
-- Go fora do PATH (acima). Working dir pode driftar (use `Set-Location` pro dir da API).
-- `go run .` deixa `rinha-fraud.exe` órfão segurando porta → `Get-Process rinha-fraud | Stop-Process`.
-- Porta 8080 do host tomada por `ors-app` → runs locais usam :8088.
-- Dataset `references.json.gz` (~48MB) e `index.bin` são gitignorados; o `.gz` precisa estar em
-  `resources/` no momento do `docker build` (o buildindex consome).
+- **2 branches:** `main`/feature (fonte completa) + `submission` (só `docker-compose.yml` por IMAGEM
+  pública + `nginx.conf` + `info.json`, **sem fonte**). Repo deve ser **público**.
+- A engine puxa do GitHub (branch submission) + Docker Hub (imagem). Use **TAG nova** a cada push +
+  `pull_policy: always` (já no submission compose) pra evitar cache.
+- Teste de prévia: issue em `zanfranceschi/rinha-de-backend-2026` com `rinha/test`. Final: automático,
+  **deadline 2026-06-05**.
 
 ## Próximo passo
 
-1. Re-pushar a imagem **uint16** (`publish.ps1`) — a live ainda é uint8.
-2. (Opcional, rumo ao topo) **classificador treinado** pra 0 failures + p99 sub-ms.
+1. **Push da imagem IVF** + atualizar `submission/` (tag nova) → **teste de prévia** pra medir o p99
+   REAL no Mac Mini (o local não serve).
+2. Sintonizar `nprobe` (16→32→64) via prévias: subir até o p99 do Mac chegar perto de 1ms (det maior).
+3. (Rumo a 6000) `nprobe` adaptativo nas queries de fronteira (score ~0.6) pra cravar E→0.
