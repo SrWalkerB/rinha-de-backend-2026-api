@@ -22,7 +22,7 @@ import (
 
 const (
 	indexMagic   uint32 = 0x32494652 // "RFI2"
-	indexVersion uint32 = 3          // v3: 16-bucket IVF (k-means cells, contiguous)
+	indexVersion uint32 = 4          // v4: SoA (dim-major per bucket) data + tail pad, for the int16 SIMD kernel
 )
 
 // Save writes the built index to path.
@@ -130,8 +130,8 @@ func readFrom(r io.Reader) (*Index, error) {
 	if len(bucketStart) != numBuckets+1 {
 		return nil, fmt.Errorf("index: bucketStart len %d != %d", len(bucketStart), numBuckets+1)
 	}
-	if len(data) != int(n)*Dims {
-		return nil, fmt.Errorf("index: data len %d != n*Dims %d", len(data), int(n)*Dims)
+	if len(data) != int(n)*Dims+simdTailPad {
+		return nil, fmt.Errorf("index: data len %d != n*Dims+pad %d", len(data), int(n)*Dims+simdTailPad)
 	}
 	if len(cellStart) != numBuckets*int(nlist)+1 {
 		return nil, fmt.Errorf("index: cellStart len %d != %d", len(cellStart), numBuckets*int(nlist)+1)

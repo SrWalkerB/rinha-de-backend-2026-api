@@ -1,11 +1,12 @@
 <#
 .SYNOPSIS
-    Sobe a stack da API (nginx LB + api1 + api2), espera ficar pronta e roda o k6.
+    Sobe a stack da API (LB próprio L4 + api1 + api2), espera ficar pronta e roda o k6.
 
 .DESCRIPTION
     Um comando = build + up + wait-ready + smoke + carga + resultado.
-    Resolve sozinho o nome do container nginx (sem hardcode) e amarra o k6 na
-    rede dele -- contorna o `network_mode: host` quebrado do Docker Desktop Win/Mac.
+    Resolve sozinho o nome do container do load balancer (lb próprio, fallback nginx;
+    sem hardcode) e amarra o k6 na rede dele -- contorna o `network_mode: host`
+    quebrado do Docker Desktop Win/Mac.
 
 .PARAMETER SkipSmoke
     Pula o smoke e vai direto pra carga real.
@@ -47,7 +48,7 @@ function Write-Bad($msg)  { Write-Host "ERRO $msg" -ForegroundColor Red }
 $null = New-Item -ItemType Directory -Force -Path (Join-Path $testDir 'test')
 
 # --- 1. Sobe a API ---------------------------------------------------------
-Write-Step 'Subindo a stack da API (nginx + api1 + api2)'
+Write-Step 'Subindo a stack da API (LB L4 próprio + api1 + api2)'
 Push-Location $apiDir
 try {
     if ($NoBuild) {
@@ -57,10 +58,11 @@ try {
     }
     if ($LASTEXITCODE -ne 0) { throw 'docker compose up falhou' }
 
-    # Descobre o container do nginx dinamicamente (id é mais robusto que nome)
-    $nginxId = (docker compose ps -q nginx).Trim()
-    if (-not $nginxId) { throw 'container nginx não encontrado' }
-    Write-Ok "nginx container: $nginxId"
+    # Descobre o container do load balancer (lb próprio OU nginx) dinamicamente.
+    $nginxId = (docker compose ps -q lb 2>$null).Trim()
+    if (-not $nginxId) { $nginxId = (docker compose ps -q nginx 2>$null).Trim() }
+    if (-not $nginxId) { throw 'container do load balancer (lb/nginx) não encontrado' }
+    Write-Ok "load balancer container: $nginxId"
 
     # --- 2. Espera AMBAS as instâncias carregarem os 3M vetores ------------
     Write-Step 'Aguardando api1 E api2 ficarem prontas (carregando 3M vetores)'
@@ -82,7 +84,7 @@ finally {
     Pop-Location
 }
 
-# --- 3. Roda o k6 (compartilhando a rede do nginx) -------------------------
+# --- 3. Roda o k6 (compartilhando a rede do load balancer) -----------------
 $dockerNet = "container:$nginxId"
 $mount     = "${testDir}:/test"
 

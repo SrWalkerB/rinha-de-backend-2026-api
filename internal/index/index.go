@@ -46,6 +46,21 @@ const numBuckets = 16
 // (zero-allocation Score). nprobe is clamped to this.
 const maxProbe = 64
 
+// simdTailPad is the number of zero uint16 appended after the SoA data array so
+// the int16 SIMD kernel's last 8-row m128 load can never read past the slice.
+const simdTailPad = 8
+
+// simdChunk is the per-call row batch for the SIMD cell scan (multiple of 8); the
+// distance buffer is a [simdChunk]int32 on the stack (zero-allocation).
+const simdChunk = 512
+
+// candK is how many candidate rows (smallest integer distance) the scan collects
+// before the exact float64 refine. Must be >> K so the true float 5-NN is always
+// within the integer-nearest candK (the int distance differs from the float only
+// by the tiny query-grid rounding). 64 keeps the refine cheap while leaving a huge
+// safety margin over K=5; the diag E-gate confirms detection is unchanged.
+const candK = 64
+
 // --- uint16 quantization (native 4-decimal grid) -------------------------
 
 const maxBucketVal = 10001 // quantize(1) = round(1*10000)+1
@@ -188,17 +203,86 @@ func (ix *Index) isFraud(i int) bool {
 	return ix.fraud[i>>6]&(1<<uint(i&63)) != 0
 }
 
-// dist2 returns the squared euclidean distance between the un-quantized query q
-// and stored row `row`, summing all Dims.
+// bucketOfRow returns the hard bucket that contains global row `row`. Used by the
+// generic dist2 (diagnostics); the hot path passes the bucket context directly.
+func (ix *Index) bucketOfRow(row int) int {
+	for b := 0; b < numBuckets; b++ {
+		if row < int(ix.bucketStart[b+1]) {
+			return b
+		}
+	}
+	return numBuckets - 1
+}
+
+// dist2 returns the exact squared euclidean distance between the un-quantized query
+// q and stored row `row`. Data is SoA (dim-major) per bucket, so this resolves the
+// row's bucket then reads the strided dim values. Used by diagnostics (BruteDebug);
+// the hot path uses dist2SoA with the bucket context already in hand.
 func (ix *Index) dist2(q *[Dims]float64, row int) float64 {
-	off := row * Dims
+	b := ix.bucketOfRow(row)
+	bLo := int(ix.bucketStart[b])
+	bRows := int(ix.bucketStart[b+1]) - bLo
+	if bRows == 0 {
+		return 0
+	}
+	return ix.dist2SoA(q, bLo*Dims, bRows, row-bLo)
+}
+
+// dist2SoA computes the exact squared distance for a row given its bucket's SoA
+// base (bLo*Dims), the bucket's row count, and the row's bucket-local index.
+func (ix *Index) dist2SoA(q *[Dims]float64, sBase, bRows, local int) float64 {
 	data := ix.data
 	var d float64
 	for i := 0; i < Dims; i++ {
-		diff := q[i] - dequantTab[data[off+i]]
+		diff := q[i] - dequantTab[data[sBase+i*bRows+local]]
 		d += diff * diff
 	}
 	return d
+}
+
+// intDist is the integer squared distance Σ (qcode[d]-code[d])² for one row, with
+// the query quantized to the native grid. ≈ float_dist*1e8; a cheap approximation
+// used to COLLECT candidate rows (the exact 5-NN comes from a float64 refine of the
+// collected candidates). Reads the SoA (dim-major) codes for bucket-local row.
+func (ix *Index) intDist(qcode *[Dims]int32, sBase, bRows, local int) int32 {
+	data := ix.data
+	var d int32
+	for i := 0; i < Dims; i++ {
+		diff := qcode[i] - int32(data[sBase+i*bRows+local])
+		d += diff * diff
+	}
+	return d
+}
+
+// scanCellCollect computes the integer distance of every row in a cell (the int16
+// SoA kernel for full 8-row blocks, scalar for the <8 tail) and feeds (dist,row)
+// into the candidate collector. No float work here — the bulk scan is pure int16
+// SIMD; the exact float64 refine runs once, on the few collected candidates.
+func (ix *Index) scanCellCollect(qcode *[Dims]int32, sBase, bRows, localLo, gLo, m int, col *intTopK) {
+	data := ix.data
+	var buf [simdChunk]int32
+	done := 0
+	for done < m {
+		c := m - done
+		if c > simdChunk {
+			c = simdChunk
+		}
+		nb := 0
+		if useSIMD {
+			nb = c / 8 // full 8-row blocks computed by the kernel
+			if nb > 0 {
+				distSoAi16AVX2(&qcode[0], &data[sBase+localLo+done], bRows, nb, &buf[0])
+				for i := 0; i < nb*8; i++ {
+					col.consider(buf[i], int32(gLo+done+i))
+				}
+			}
+		}
+		// Tail rows (and the whole cell when !useSIMD): scalar int distance.
+		for i := nb * 8; i < c; i++ {
+			col.consider(ix.intDist(qcode, sBase, bRows, localLo+done+i), int32(gLo+done+i))
+		}
+		done += c
+	}
 }
 
 // centroidDist returns the squared distance from q to centroid `cell` (a global
@@ -254,14 +338,24 @@ func (ix *Index) ScoreScan(query [Dims]float64) (float64, int) {
 }
 
 func (ix *Index) searchTopK(q *[Dims]float64) (topK, int) {
-	tk := newTopK()
 	scanned := 0
+
+	// Quantize the query to the native grid once. The scan computes only INTEGER
+	// distances (int16 SIMD kernel) and collects the candK rows of smallest integer
+	// distance; the exact float64 5-NN is then refined from just those candidates.
+	var qcode [Dims]int32
+	for i := 0; i < Dims; i++ {
+		qcode[i] = int32(quantize(q[i]))
+	}
+
+	col := newIntTopK()
 	b0 := bucketOf(q)
+	ix.probeBucket(q, &qcode, b0, &col, &scanned)
 
-	ix.probeBucket(q, b0, &tk, &scanned)
-
-	// Cross-bucket: only buckets whose forced penalty could still beat the
-	// running 5th distance. With a populated own bucket this rarely fires.
+	// Cross-bucket: skip a bucket only when its forced penalty (a real-distance
+	// lower bound, scaled to integer ~*1e8) is beyond the worst collected candidate
+	// by a safe margin (>= 1e5 covers the query-grid rounding |d_int-d_float*1e8| <=
+	// sqrt(14*d_float)*1e4). Conservative — never drops a true top-5 bucket.
 	for b := 0; b < numBuckets; b++ {
 		if b == b0 {
 			continue
@@ -269,10 +363,17 @@ func (ix *Index) searchTopK(q *[Dims]float64) (topK, int) {
 		if ix.maxScan > 0 && scanned >= ix.maxScan {
 			break
 		}
-		if bucketPenalty(q, b) >= tk.worst() {
+		if col.full() && bucketPenalty(q, b)*1e8 >= float64(col.worst())+1e5 {
 			continue
 		}
-		ix.probeBucket(q, b, &tk, &scanned)
+		ix.probeBucket(q, &qcode, b, &col, &scanned)
+	}
+
+	// Exact refine: float64 distance for the few collected candidates → exact 5-NN.
+	tk := newTopK()
+	for i := 0; i < col.n; i++ {
+		row := int(col.row[i])
+		tk.consider(ix.dist2(q, row), ix.isFraud(row))
 	}
 	return tk, scanned
 }
@@ -280,7 +381,7 @@ func (ix *Index) searchTopK(q *[Dims]float64) (topK, int) {
 // probeBucket scans the nprobe nearest cells of bucket b. Cell selection touches
 // only the nlist centroids (contiguous); the chosen cells are contiguous row
 // runs, so the candidate scan is prefetch-friendly.
-func (ix *Index) probeBucket(q *[Dims]float64, b int, tk *topK, scanned *int) {
+func (ix *Index) probeBucket(q *[Dims]float64, qcode *[Dims]int32, b int, col *intTopK, scanned *int) {
 	base := b * ix.nlist
 	np := ix.nprobe
 	if np > ix.nlist {
@@ -314,16 +415,21 @@ func (ix *Index) probeBucket(q *[Dims]float64, b int, tk *topK, scanned *int) {
 		pc[pos] = int32(base + c)
 	}
 
+	bLo := int(ix.bucketStart[b])
+	bRows := int(ix.bucketStart[b+1]) - bLo
+	sBase := bLo * Dims
 	for i := 0; i < np; i++ {
 		if pd[i] == math.MaxFloat64 {
 			break // fewer non-empty candidates than np
 		}
 		cell := int(pc[i])
-		lo, hi := ix.cellStart[cell], ix.cellStart[cell+1]
-		for r := lo; r < hi; r++ {
-			tk.consider(ix.dist2(q, int(r)), ix.isFraud(int(r)))
+		lo, hi := int(ix.cellStart[cell]), int(ix.cellStart[cell+1])
+		m := hi - lo
+		if m <= 0 {
+			continue
 		}
-		*scanned += int(hi - lo)
+		ix.scanCellCollect(qcode, sBase, bRows, lo-bLo, lo, m, col)
+		*scanned += m
 		if ix.maxScan > 0 && *scanned >= ix.maxScan {
 			return
 		}
@@ -367,6 +473,46 @@ func newTopK() topK {
 
 // worst is the distance of the current K-th nearest.
 func (t *topK) worst() float64 { return t.dist[K-1] }
+
+// intTopK collects the candK rows of smallest INTEGER distance during the scan
+// (sorted ascending, stack-resident, zero-allocation). Its worst() drives the
+// conservative cross-bucket prune; its rows are the candidates the float64 refine
+// turns into the exact 5-NN.
+type intTopK struct {
+	dist [candK]int32
+	row  [candK]int32
+	n    int
+}
+
+func newIntTopK() intTopK {
+	var t intTopK
+	for i := range t.dist {
+		t.dist[i] = math.MaxInt32
+	}
+	return t
+}
+
+func (t *intTopK) full() bool    { return t.n >= candK }
+func (t *intTopK) worst() int32  { return t.dist[candK-1] }
+
+// consider inserts (d, row) if it beats the current candK-th smallest. Strict `<`
+// (first-seen wins ties) so the candidate set is deterministic.
+func (t *intTopK) consider(d, row int32) {
+	if d >= t.dist[candK-1] {
+		return
+	}
+	pos := candK - 1
+	for pos > 0 && t.dist[pos-1] > d {
+		t.dist[pos] = t.dist[pos-1]
+		t.row[pos] = t.row[pos-1]
+		pos--
+	}
+	t.dist[pos] = d
+	t.row[pos] = row
+	if t.n < candK {
+		t.n++
+	}
+}
 
 // consider inserts (dist, fraud) if it beats the current K-th. The strict `<`
 // (first-seen wins ties) matches the float64 ground-truth oracle.

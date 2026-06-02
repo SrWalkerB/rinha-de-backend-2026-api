@@ -139,13 +139,35 @@ func (b *Builder) Build() *Index {
 	ix.cellStart[numBuckets*nlist] = int32(b.n)
 
 	// 4. Pack fraud bits over the final row order.
-	ix.data = finalData
 	ix.fraud = make([]uint64, (b.n+63)/64)
 	for r := 0; r < b.n; r++ {
 		if finalFraud[r] {
 			ix.fraud[r>>6] |= 1 << uint(r&63)
 		}
 	}
+
+	// 5. Transpose each bucket to SoA (dim-major) for the SIMD row kernel. Within a
+	//    bucket's row range, store all rows' dim 0, then all rows' dim 1, ... so the
+	//    kernel can load 8 consecutive rows' dim-d codes in one m128. Cells stay
+	//    contiguous local-row ranges within each dim segment (cellStart unchanged,
+	//    still global rows). Row identity / fraud bits / centroids are unchanged.
+	//    +simdTailPad uint16 of zero tail so the kernel's last m128 load can't OOB.
+	soa := make([]uint16, b.n*Dims+simdTailPad)
+	for bk := 0; bk < numBuckets; bk++ {
+		lo, hi := int(ix.bucketStart[bk]), int(ix.bucketStart[bk+1])
+		bRows := hi - lo
+		if bRows == 0 {
+			continue
+		}
+		bBase := lo * Dims
+		for local := 0; local < bRows; local++ {
+			off := (lo + local) * Dims
+			for d := 0; d < Dims; d++ {
+				soa[bBase+d*bRows+local] = finalData[off+d]
+			}
+		}
+	}
+	ix.data = soa
 	return ix
 }
 

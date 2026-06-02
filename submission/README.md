@@ -1,13 +1,15 @@
 # Branch `submission` — arquivos de deploy
 
-Estes 3 arquivos são o **conteúdo da raiz da branch `submission`** (sem código-fonte,
-conforme `docs/br/SUBMISSAO.md`):
+Conteúdo da raiz da branch `submission` (sem código-fonte, conforme `docs/br/SUBMISSAO.md`):
 
 | arquivo | o que é |
 |---|---|
-| `docker-compose.yml` | sobe nginx + api1 + api2 a partir da **imagem pública** (sem `build:`) |
-| `nginx.conf` | load balancer round-robin na :9999 |
-| `info.json` | metadados da submissão |
+| `docker-compose.yml` | sobe **lb (L4 próprio) + api1 + api2** a partir da **imagem pública** (sem `build:`) |
+| `info.json` | metadados da submissão (stack = `["go"]`) |
+
+> `nginx.conf` é **legado** — a stack atual NÃO usa nginx; o load balancer é o nosso
+> binário Go L4 (`/app/lb`, mesma imagem, entrypoint próprio). Pode ser removido da
+> branch `submission`. Mantido só como referência do fallback de revert pra `2.2`.
 
 A imagem referenciada **já carrega o `index.bin`** (índice IVF pré-construído no build),
 então o teste sobe sem dataset e sem fonte.
@@ -17,12 +19,13 @@ então o teste sobe sem dataset e sem fonte.
 ### 1. Publicar a imagem (uma vez por versão)
 
 ```powershell
-.\publish.ps1 -User SEU_USUARIO_DOCKERHUB
+.\publish.ps1 -User SEU_USUARIO_DOCKERHUB -Tag 3.0
 # builda com index.bin embutido (linux/amd64) e faz push pro registry público
 ```
 
 Depois, ajuste a linha `image:` em `submission/docker-compose.yml` pro nome que você publicou
-(o default é `srwalkerb/rinha-fraud:1.0`).
+(atual: `srwalkerb/rinha-fraud:3.0`). Use TAG NOVA a cada versão (busta o cache da engine de
+avaliação e casa com o compose).
 
 ### 2. Branches do repositório
 
@@ -34,11 +37,16 @@ Para **regerar/atualizar** a branch `submission` depois de mexer nestes arquivos
 
 ```powershell
 git checkout submission
-Copy-Item submission\docker-compose.yml, submission\nginx.conf, submission\info.json . -Force
-git add docker-compose.yml nginx.conf info.json
-git commit -m "update submission deploy files"
+Copy-Item submission\docker-compose.yml, submission\info.json . -Force
+git rm --ignore-unmatch nginx.conf            # legado: stack agora é go-only (L4 LB próprio)
+git add docker-compose.yml info.json
+git commit -m "submission: image 3.0 (SIMD SoA int16 + LB L4 próprio), stack go-only"
 git checkout main
 ```
+
+> **Revert pro provado (4056):** se a prévia da `3.0` regredir vs 4056, volte a branch
+> `submission` pro commit `88a459f` (image `2.2` + nginx 0.30/api 0.35×2) ANTES de 06-05 —
+> o teste final usa `origin/submission` na data, então um preview ruim é recuperável.
 
 ### 3. Subir pro GitHub (repo PÚBLICO)
 

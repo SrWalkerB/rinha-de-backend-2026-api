@@ -14,6 +14,8 @@ COPY resources/normalization.json resources/mcc_risk.json ./resources/
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go build -trimpath -ldflags="-s -w" -o /out/rinha-fraud . && \
     CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -trimpath -ldflags="-s -w" -o /out/lb ./cmd/lb && \
+    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go build -trimpath -o /out/buildindex ./cmd/buildindex
 
 # Build the partitioned k-d index OFFLINE (no CPU cap here): bucket + per-bucket
@@ -28,6 +30,9 @@ RUN REFERENCES_PATH=./resources/references.json.gz \
 FROM gcr.io/distroless/static-debian12:nonroot
 WORKDIR /app
 COPY --from=build /out/rinha-fraud /app/rinha-fraud
+# Minimal L4 load balancer (same image, different entrypoint via compose). Lets
+# the LB run on far less CPU than nginx, freeing it for the CPU-bound APIs.
+COPY --from=build /out/lb /app/lb
 # Prebuilt index baked into the image (replaces the raw dataset). Startup just
 # reads it — no k-means under the CPU cap.
 COPY --from=build /out/index.bin /app/index.bin
