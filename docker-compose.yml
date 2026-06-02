@@ -24,8 +24,11 @@ x-api: &api
     # Busca 5-NN por IVF (k-means contíguo por bucket). Knob sintonizável SEM
     # rebuild: INDEX_NPROBE = células varridas por bucket/query (maior = mais
     # recall/det, mais lento). INDEX_MAX_SCAN = teto de linhas/query (guarda de cauda).
-    INDEX_NPROBE: "32"
-    INDEX_NPROBE_HIGH: "328"
+    INDEX_NPROBE: "16"
+    INDEX_NPROBE_HIGH: "192"
+    INDEX_NPROBE_HIGH_C2: "192"
+    INDEX_NPROBE_HIGH_C3: "128"
+    INDEX_NPROBE_HIGH_C4: "64"
     INDEX_TRIGGER_MARGIN: "1"
     INDEX_MAX_SCAN: "0"
   networks:

@@ -163,17 +163,20 @@ func main() {
 
 	refPath := getenv("REFERENCES_PATH", "./resources/references.json.gz")
 	capHint := atoiEnv("REFERENCES_CAPACITY", 3_000_000)
-	nprobe := atoiEnv("INDEX_NPROBE", 32)   // cheap-tier cells scanned per bucket per query
+	nprobe := atoiEnv("INDEX_NPROBE", 16)   // cheap-tier cells scanned per bucket per query
 	maxScan := atoiEnv("INDEX_MAX_SCAN", 0) // 0 = unlimited; tail guardrail
 	// Adaptive (two-tier) nprobe: a query whose cheap-pass 5th-NN radius reaches
 	// TRIGGER_RADIUS re-runs at NPROBE_HIGH (drives the cross-bucket misses to 0
 	// while only escalating the rare borderline query). HIGH≤NPROBE disables it.
-	nprobeHigh := atoiEnv("INDEX_NPROBE_HIGH", 328)
+	nprobeHigh := atoiEnv("INDEX_NPROBE_HIGH", 192)
 	// Margin gate (primary): escalate when the cheap vote is within this many votes
 	// of the 0.6 boundary (count 2..4). Measured E=0 at ~3% escalation. Radius is the
 	// fallback gate, used only when margin<0.
 	triggerMargin := atofEnv("INDEX_TRIGGER_MARGIN", 1)
 	triggerRadius := atofEnv("INDEX_TRIGGER_RADIUS", 0.98)
+	nprobeHighC2 := atoiEnv("INDEX_NPROBE_HIGH_C2", nprobeHigh)
+	nprobeHighC3 := atoiEnv("INDEX_NPROBE_HIGH_C3", nprobeHigh)
+	nprobeHighC4 := atoiEnv("INDEX_NPROBE_HIGH_C4", nprobeHigh)
 
 	tune := func(ix *index.Index) {
 		ix.SetNProbe(nprobe)
@@ -181,6 +184,9 @@ func main() {
 		ix.SetTriggerRadius(triggerRadius)
 		ix.SetTriggerMargin(triggerMargin)
 		ix.SetNProbeHigh(nprobeHigh) // after SetNProbe: HIGH is compared to the cheap nprobe
+		ix.SetNProbeHighForCount(2, nprobeHighC2)
+		ix.SetNProbeHighForCount(3, nprobeHighC3)
+		ix.SetNProbeHighForCount(4, nprobeHighC4)
 	}
 
 	go func() {

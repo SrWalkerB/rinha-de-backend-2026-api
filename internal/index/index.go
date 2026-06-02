@@ -183,9 +183,10 @@ type Index struct {
 	// only queries that miss are those whose true 5-NN crosses a hard-bucket
 	// boundary, i.e. radius near/above 1.0). nprobeHigh<=nprobe disables the high
 	// pass (zero-value default => behaviour identical to the single-tier search).
-	nprobeHigh    int     // cells/bucket for the escalated pass (0/<=nprobe = off)
-	triggerRadius float64 // escalate when topK.worst() >= this (squared distance)
-	triggerMargin float64 // optional AND-gate: also require |count-K*Threshold|<=margin (<0 = off)
+	nprobeHigh        int        // cells/bucket for the escalated pass (0/<=nprobe = off)
+	nprobeHighByCount [K + 1]int // optional per-cheap-vote high nprobe (0 = use nprobeHigh)
+	triggerRadius     float64    // escalate when topK.worst() >= this (squared distance)
+	triggerMargin     float64    // optional AND-gate: also require |count-K*Threshold|<=margin (<0 = off)
 }
 
 // SearchTrace describes the two-tier search decision. It is diagnostic-only and
@@ -232,6 +233,9 @@ func (ix *Index) SetMaxScan(n int) {
 func (ix *Index) SetNProbeHigh(np int) {
 	if np <= 0 {
 		ix.nprobeHigh = 0
+		for i := range ix.nprobeHighByCount {
+			ix.nprobeHighByCount[i] = 0
+		}
 		return
 	}
 	if np > ix.nlist {
@@ -241,6 +245,29 @@ func (ix *Index) SetNProbeHigh(np int) {
 		np = maxProbe
 	}
 	ix.nprobeHigh = np
+	for i := range ix.nprobeHighByCount {
+		ix.nprobeHighByCount[i] = np
+	}
+}
+
+// SetNProbeHighForCount overrides the escalated-pass nprobe for a specific
+// cheap-pass fraud count. This lets boundary classes spend different amounts of
+// CPU while preserving the old single HIGH knob as the default.
+func (ix *Index) SetNProbeHighForCount(count, np int) {
+	if count < 0 || count > K {
+		return
+	}
+	if np <= 0 {
+		ix.nprobeHighByCount[count] = 0
+		return
+	}
+	if np > ix.nlist {
+		np = ix.nlist
+	}
+	if np > maxProbe {
+		np = maxProbe
+	}
+	ix.nprobeHighByCount[count] = np
 }
 
 // SetTriggerRadius sets the squared-distance threshold on the cheap pass's 5th-NN
@@ -470,21 +497,30 @@ func (ix *Index) searchTopKTrace(q *[Dims]float64) (topK, int, SearchTrace) {
 	}
 
 	tk, scanned := ix.searchAt(q, &qcode, ix.nprobe, ix.maxScan)
+	cheapCount := fraudCount(&tk)
 	trace := SearchTrace{
-		CheapFraudCount: fraudCount(&tk),
+		CheapFraudCount: cheapCount,
 		CheapScanned:    scanned,
 	}
 
-	if ix.nprobeHigh > ix.nprobe && ix.shouldEscalate(&tk) {
+	nprobeHigh := ix.highProbeForCount(cheapCount)
+	if nprobeHigh > ix.nprobe && ix.shouldEscalate(&tk) {
 		// Escalate: the high pass is a strict superset of the cheap one, so the
 		// refined 5-NN can only improve. maxScan is disabled here — escalation is
 		// the "spend more" path and must never be truncated.
-		tk2, sc2 := ix.searchAt(q, &qcode, ix.nprobeHigh, 0)
+		tk2, sc2 := ix.searchAt(q, &qcode, nprobeHigh, 0)
 		trace.Escalated = true
 		trace.HighScanned = sc2
 		return tk2, scanned + sc2, trace
 	}
 	return tk, scanned, trace
+}
+
+func (ix *Index) highProbeForCount(count int) int {
+	if count >= 0 && count <= K && ix.nprobeHighByCount[count] > 0 {
+		return ix.nprobeHighByCount[count]
+	}
+	return ix.nprobeHigh
 }
 
 // shouldEscalate decides whether the cheap pass warrants the high-nprobe re-run.

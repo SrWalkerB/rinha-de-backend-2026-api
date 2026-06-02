@@ -7,7 +7,7 @@ import (
 
 // Default build parameters.
 const (
-	DefaultNList       = 4096 // k-means cells per bucket
+	DefaultNList       = 1024 // k-means cells per bucket
 	DefaultKMeansIters = 10
 	kmeansSample       = 50000 // rows sampled to train k-means per bucket (bounds build cost)
 )

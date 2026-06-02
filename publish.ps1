@@ -32,9 +32,9 @@ try {
         throw "Falta resources\references.json.gz — necessário no build pra cozinhar o index.bin."
     }
 
-    Write-Host "`n=== Build $image (linux/amd64; IVF nlist baked = 4096) ===" -ForegroundColor Cyan
+    Write-Host "`n=== Build $image (linux/amd64; IVF nlist baked = 1024) ===" -ForegroundColor Cyan
     # --platform garante linux/amd64 (host de avaliação é Mac Mini Haswell amd64).
-    # O índice IVF (nlist=4096) é cozido pelo buildindex dentro do Dockerfile.
+    # O índice IVF (nlist=1024) é cozido pelo buildindex dentro do Dockerfile.
     docker build --platform linux/amd64 -t $image .
     if ($LASTEXITCODE -ne 0) { throw 'docker build falhou' }
 

@@ -116,6 +116,9 @@ func main() {
 	ix.SetTriggerRadius(triggerRadius)
 	ix.SetTriggerMargin(triggerMargin)
 	ix.SetNProbeHigh(nprobeHigh) // after SetNProbe: HIGH compared to cheap nprobe
+	ix.SetNProbeHighForCount(2, envi("INDEX_NPROBE_HIGH_C2", nprobeHigh))
+	ix.SetNProbeHighForCount(3, envi("INDEX_NPROBE_HIGH_C3", nprobeHigh))
+	ix.SetNProbeHighForCount(4, envi("INDEX_NPROBE_HIGH_C4", nprobeHigh))
 	log.Printf("nlist=%d nprobe=%d nprobeHigh=%d triggerRadius=%.3f triggerMargin=%.2f maxScan=%d",
 		ix.NList(), nprobe, nprobeHigh, triggerRadius, triggerMargin, envi("INDEX_MAX_SCAN", 0))
 

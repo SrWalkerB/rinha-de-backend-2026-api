@@ -221,3 +221,25 @@ func TestNProbeHighAllowsWideEscalation(t *testing.T) {
 		t.Fatalf("nprobeHigh = %d, want 512", ix.nprobeHigh)
 	}
 }
+
+func TestNProbeHighForCountOverridesDefault(t *testing.T) {
+	b := NewBuilder(10, 128, 1)
+	for i := 0; i < 10; i++ {
+		b.Add(randVec(rand.New(rand.NewSource(int64(i)))), false)
+	}
+	ix := b.Build()
+	ix.SetNProbe(16)
+	ix.SetNProbeHigh(96)
+	ix.SetNProbeHighForCount(2, 128)
+	ix.SetNProbeHighForCount(4, 32)
+
+	if got := ix.highProbeForCount(2); got != 128 {
+		t.Fatalf("highProbeForCount(2) = %d, want 128", got)
+	}
+	if got := ix.highProbeForCount(3); got != 96 {
+		t.Fatalf("highProbeForCount(3) = %d, want 96", got)
+	}
+	if got := ix.highProbeForCount(4); got != 32 {
+		t.Fatalf("highProbeForCount(4) = %d, want 32", got)
+	}
+}
