@@ -8,12 +8,10 @@ COPY main.go ./
 COPY internal/ ./internal/
 COPY cmd/ ./cmd/
 COPY resources/normalization.json resources/mcc_risk.json ./resources/
-# GOAMD64=v3 (AVX2+FMA+BMI) no binário de runtime: o host de avaliação é um Mac
-# Mini Late 2014 (Intel Haswell i5-4278U), a 1ª geração com v3 completo. Isso
-# auto-vetoriza os loops de distância float64 (sobretudo o scan de centróides
-# O(nlist) por query) -> corta CPU/query -> menos throttle CFS -> p99 menor.
-# buildindex fica baseline (roda no host de build, não é crítico de performance).
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOAMD64=v3 \
+# NB: GOAMD64=v3 foi testado e REVERTIDO — o compilador do Go não auto-vetoriza
+# os loops de distância (só muda FMA/BMI), então v3 ficou ~16% MAIS LENTO no bench
+# (ver microbench v1 27us vs v3 31us). SIMD real exigiria assembly à mão.
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go build -trimpath -ldflags="-s -w" -o /out/rinha-fraud . && \
     CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go build -trimpath -o /out/buildindex ./cmd/buildindex
