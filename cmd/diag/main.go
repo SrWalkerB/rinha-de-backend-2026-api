@@ -107,9 +107,17 @@ func main() {
 		}
 		log.Printf("index over %d vectors in %s", ix.Len(), time.Since(t0))
 	}
-	ix.SetNProbe(envi("INDEX_NPROBE", 8))
+	nprobe := envi("INDEX_NPROBE", 16)
+	nprobeHigh := envi("INDEX_NPROBE_HIGH", 0) // 0 = single-tier (off); sweep turns it on
+	triggerRadius := envf("INDEX_TRIGGER_RADIUS", 0.98)
+	triggerMargin := envf("INDEX_TRIGGER_MARGIN", -1)
+	ix.SetNProbe(nprobe)
 	ix.SetMaxScan(envi("INDEX_MAX_SCAN", 0))
-	log.Printf("nlist=%d nprobe=%d maxScan=%d", ix.NList(), envi("INDEX_NPROBE", 8), envi("INDEX_MAX_SCAN", 0))
+	ix.SetTriggerRadius(triggerRadius)
+	ix.SetTriggerMargin(triggerMargin)
+	ix.SetNProbeHigh(nprobeHigh) // after SetNProbe: HIGH compared to cheap nprobe
+	log.Printf("nlist=%d nprobe=%d nprobeHigh=%d triggerRadius=%.3f triggerMargin=%.2f maxScan=%d",
+		ix.NList(), nprobe, nprobeHigh, triggerRadius, triggerMargin, envi("INDEX_MAX_SCAN", 0))
 
 	// Test set.
 	tb, err := os.ReadFile(tdPath)
@@ -136,14 +144,18 @@ func main() {
 
 	// --- Pass 1: partitioned Score over entries (failures, latency, scan) ---
 	var fp, fn int
+	var escalated int
 	scanned := make([]int, pass1)
 	latNs := make([]int64, pass1)
 	start := time.Now()
 	for i := 0; i < pass1; i++ {
 		q0 := time.Now()
-		score, sc := ix.ScoreScan(queries[i])
+		score, sc, esc := ix.ScoreScanEscalated(queries[i])
 		latNs[i] = time.Since(q0).Nanoseconds()
 		scanned[i] = sc
+		if esc {
+			escalated++
+		}
 		approved := score < index.Threshold
 		if approved != td.Entries[i].ExpectedApproved {
 			if approved { // approved a fraud → false negative
@@ -200,6 +212,8 @@ func main() {
 	log.Printf("  FP=%d  FN=%d  failures=%d  E=%d  eps=%.6f  failure_rate=%.6f%%",
 		fp, fn, failures, E, eps, failRate*100)
 	log.Printf("  detection_score ~= %.1f  (cap +3000 at E=0)", detScore)
+	log.Printf("  escalated=%d  (%.2f%% of queries hit the high-nprobe pass)",
+		escalated, float64(escalated)/float64(pass1)*100)
 	log.Printf("================ EXACTNESS (partitioned vs brute oracle) ============")
 	log.Printf("  checked=%d  mismatches=%d  (want 0 => partitioned == exact 5-NN)", len(kth), mismatch)
 	log.Printf("================ 5th-NN squared distance (search radius) ============")

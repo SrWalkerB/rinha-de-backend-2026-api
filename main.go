@@ -157,6 +157,15 @@ func atoiEnv(key string, def int) int {
 	return def
 }
 
+func atofEnv(key string, def float64) float64 {
+	if v := os.Getenv(key); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
+		}
+	}
+	return def
+}
+
 func main() {
 	vec, err := loadVectorizer()
 	if err != nil {
@@ -166,12 +175,24 @@ func main() {
 
 	refPath := getenv("REFERENCES_PATH", "./resources/references.json.gz")
 	capHint := atoiEnv("REFERENCES_CAPACITY", 3_000_000)
-	nprobe := atoiEnv("INDEX_NPROBE", 8)    // cells scanned per bucket per query
+	nprobe := atoiEnv("INDEX_NPROBE", 16)   // cheap-tier cells scanned per bucket per query
 	maxScan := atoiEnv("INDEX_MAX_SCAN", 0) // 0 = unlimited; tail guardrail
+	// Adaptive (two-tier) nprobe: a query whose cheap-pass 5th-NN radius reaches
+	// TRIGGER_RADIUS re-runs at NPROBE_HIGH (drives the cross-bucket misses to 0
+	// while only escalating the rare borderline query). HIGH≤NPROBE disables it.
+	nprobeHigh := atoiEnv("INDEX_NPROBE_HIGH", 192)
+	// Margin gate (primary): escalate when the cheap vote is within this many votes
+	// of the 0.6 boundary (count 2..4). Measured E=0 at ~3% escalation. Radius is the
+	// fallback gate, used only when margin<0.
+	triggerMargin := atofEnv("INDEX_TRIGGER_MARGIN", 1)
+	triggerRadius := atofEnv("INDEX_TRIGGER_RADIUS", 0.98)
 
 	tune := func(ix *index.Index) {
 		ix.SetNProbe(nprobe)
 		ix.SetMaxScan(maxScan)
+		ix.SetTriggerRadius(triggerRadius)
+		ix.SetTriggerMargin(triggerMargin)
+		ix.SetNProbeHigh(nprobeHigh) // after SetNProbe: HIGH is compared to the cheap nprobe
 	}
 
 	go func() {
@@ -184,8 +205,8 @@ func main() {
 				tune(ix)
 				s.ix.Store(ix)
 				s.ready.Store(true)
-				log.Printf("ready: loaded prebuilt index %s (%d vectors, nlist=%d nprobe=%d) in %s",
-					path, ix.Len(), ix.NList(), nprobe, time.Since(t0))
+				log.Printf("ready: loaded prebuilt index %s (%d vectors, nlist=%d nprobe=%d nprobeHigh=%d triggerRadius=%.3f) in %s",
+					path, ix.Len(), ix.NList(), nprobe, nprobeHigh, triggerRadius, time.Since(t0))
 				return
 			}
 			log.Printf("prebuilt index %s unavailable (%v); building from references", path, err)

@@ -84,7 +84,21 @@ escalar guardado por CPUID — nunca SIGILL).
 
 **Prévia real (Mac Mini, 2026-06-02, img `srwalkerb/rinha-fraud:2.3`, commit 436fb82, nprobe=16):**
 p99=**51.18ms** (p99_score 1290.9), E=31 (FP=10/FN=7/Err=0), det_score 2548.5, **final=3839.4**.
-→ p99 domina o gap pro 6000 (precisa 51ms→~1ms = +1710; det adaptativo rende só ~+450).
+
+**Evolução (prévias 06-02):** img 3.0 (LB L4 0.10 + api 0.45×2) REGREDIU p99→194ms (LB faminto de CPU,
+NÃO imbalance — skew era 1×); img 4.0 (LB **0.25** + api 0.375×2) → **p99=2.563ms, E=31, final=5139.66**
+(#79). Lição: LB L4 (splice) balanceia bem, mas precisa de **CPU suficiente** (≥0.20-0.25), senão a
+fila do LB vira a cauda.
+
+**nprobe ADAPTATIVO (Fase 1, implementado 06-02): E=31→0 sem flat-192.** Sweep no diag PROVOU que E=31
+era artefato do clamp `maxProbe=64` (subido p/ 256); flat nprobe=192 dá E=0 mas 11× compute. Two-tier:
+passada barata nprobe=16 → escala p/ nprobeHigh=192 **só nas queries de fronteira**. Gatilho VENCEDOR =
+**voto perto do 0.6** (`triggerMargin=1` → count∈{2,3,4}); o gatilho de raio do 5º-NN FALHOU (passada
+aproximada infla `worst()` → dispara ~34% e ainda erra). Medido: **margin=1 → E=0, det=3000, escala
+3.09%** (margin=0 → E=26; margin=2 → 46% escala). nprobeHigh<192 não fecha E=0. AND-gate de raio quebra
+E=0. ⚠️ **Risco a medir na prévia:** escala 3.09% > 1% → a query do p99 É escalada (work p99 19k→129k
+rows) → p99 do Mac pode subir ~2.56→~3ms (p99_score −68), mas det +452 domina (net ~+384).
+Knobs: `INDEX_NPROBE_HIGH`/`INDEX_TRIGGER_MARGIN`/`INDEX_TRIGGER_RADIUS` (margin≥0 manda; raio é fallback).
 
 ## Aprendizados-chave (NÃO re-descobrir)
 
@@ -147,10 +161,13 @@ $env:INDEX_PATH=".\resources\index.bin"; $env:INDEX_NPROBE="16"; go run ./cmd/di
 | Var | Default | Onde |
 |---|---|---|
 | `INDEX_PATH` | (vazio) | runtime — carrega índice pronto; senão fallback build |
-| `INDEX_NPROBE` | 8 (compose: 16) | runtime — células IVF varridas/bucket/query (retuna SEM rebuild) |
+| `INDEX_NPROBE` | 16 | runtime — células IVF varridas/bucket/query, tier BARATO (retuna SEM rebuild) |
+| `INDEX_NPROBE_HIGH` | 192 | runtime — nprobe do tier ESCALADO (≤NPROBE desliga). 192 = E=0 |
+| `INDEX_TRIGGER_MARGIN` | 1 | runtime — escala se voto a ≤margin do 0.6 (count∈{2,3,4}). ≥0 manda |
+| `INDEX_TRIGGER_RADIUS` | 0.98 | runtime — gatilho FALLBACK por raio 5º-NN (só usado se MARGIN<0) |
 | `INDEX_NLIST` | 1024 | build — células k-means por bucket |
 | `INDEX_KMEANS_ITERS` | 10 | build — iterações do k-means |
-| `INDEX_MAX_SCAN` | 0 (ilimitado) | runtime — teto de linhas/query (guarda de cauda) |
+| `INDEX_MAX_SCAN` | 0 (ilimitado) | runtime — teto de linhas/query, tier barato (escalada ignora) |
 | `GOMAXPROCS/GOMEMLIMIT/GOGC` | 1 / 150MiB / off | compose |
 | `ADDR` | :8080 | porta da API (nginx expõe 9999) |
 | `PPROF_ADDR` | (vazio) | debug — NUNCA setar na submissão |
@@ -164,11 +181,15 @@ $env:INDEX_PATH=".\resources\index.bin"; $env:INDEX_NPROBE="16"; go run ./cmd/di
 - Teste de prévia: issue em `zanfranceschi/rinha-de-backend-2026` com `rinha/test`. Final: automático,
   **deadline 2026-06-05**.
 
-## Próximo passo (revisado 2026-06-02 — prévia deu 3839, gargalo = p99 51ms)
+## Próximo passo (revisado 2026-06-02 — plano 2-fases pros 6000; ver plano em ~/.claude/plans/)
 
-1. **Vetorizar o hot loop (SIMD/AVX2).** Maior alavanca: p99 51ms→~1ms = +1710. Distância em
-   `internal/index/index.go` via `avo`/Plan9-asm ou `unsafe`+lanes. Recupera o 8–16x que Go perde
-   sem autovec. Medir compute/query antes/depois no diag.
-2. **Com SIMD, reavaliar brute exato** (sem IVF): pode cravar E=0 **e** p99 sub-ms de uma vez (prévia
-   provou que dá: líder fez 0.36ms/E=0). Se viável, mata o trade-off do nprobe.
-3. Secundário: `nprobe` adaptativo na fronteira (score ~0.6) pra E→0 (det +450); só depois do p99.
+Gap atual (do 4.0, final 5139): **det +452 (E→0) + p99 +409 (2.56→≤1ms) = 6000.**
+
+1. ✅ **FASE 1 FEITA: nprobe adaptativo (margin=1) → E=0, det 3000.** SIMD+adaptativo já no código.
+   Falta **shippar (img 5.0) + prévia** pra ver o p99 real (escala 3% pode subir p99 ~2.56→~3ms;
+   det +452 domina). Esperado: ~5500-5590.
+2. **FASE 2: p99 2.56ms→≤1ms (+409).** PROFILING por estágio primeiro (HTTP/JSON vs hop-LB vs throttle
+   CFS vs compute) — meça antes. Candidatos: HTTP/JSON custom (largar net/http+encoding/json), achatar
+   cauda de compute, tunar CPU split. Não otimizar no escuro.
+3. Se p99 não fechar ≤1ms em Go (floor de runtime), teto prático ~5800-5900. 6000 é provado no Mac
+   (líder 0.967ms+E=0).

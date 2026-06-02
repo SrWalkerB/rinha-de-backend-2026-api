@@ -42,9 +42,9 @@ const Threshold = 0.6
 // numBuckets = 2^4: is_online, card_present, unknown_merchant, null flag.
 const numBuckets = 16
 
-// maxProbe caps nprobe so the per-query probe buffer lives on the stack
-// (zero-allocation Score). nprobe is clamped to this.
-const maxProbe = 1024
+// maxProbe caps nprobe (low AND high tier) so the per-query probe buffer lives
+// on the stack (zero-allocation Score). nprobe and nprobeHigh are clamped to this.
+const maxProbe = 256
 
 // simdTailPad is the number of zero uint16 appended after the SoA data array so
 // the int16 SIMD kernel's last 8-row m128 load can never read past the slice.
@@ -175,8 +175,17 @@ type Index struct {
 
 	bucketStart [17]int32 // rows of bucket b = [bucketStart[b], bucketStart[b+1])
 
-	nprobe  int // cells scanned per bucket per query (runtime knob)
+	nprobe  int // cells scanned per bucket per query (cheap tier, runtime knob)
 	maxScan int // per-query row cap (0 = unlimited); tail guardrail
+
+	// Adaptive (two-tier) nprobe. The cheap pass runs at nprobe; if its 5th-NN
+	// search radius reaches triggerRadius the query is re-run at nprobeHigh (the
+	// only queries that miss are those whose true 5-NN crosses a hard-bucket
+	// boundary, i.e. radius near/above 1.0). nprobeHigh<=nprobe disables the high
+	// pass (zero-value default => behaviour identical to the single-tier search).
+	nprobeHigh    int     // cells/bucket for the escalated pass (0/<=nprobe = off)
+	triggerRadius float64 // escalate when topK.worst() >= this (squared distance)
+	triggerMargin float64 // optional AND-gate: also require |count-K*Threshold|<=margin (<0 = off)
 }
 
 // Len reports how many reference vectors are stored.
@@ -206,6 +215,41 @@ func (ix *Index) SetMaxScan(n int) {
 		n = 0
 	}
 	ix.maxScan = n
+}
+
+// SetNProbeHigh sets the escalated-pass nprobe (clamped to [1, min(nlist,
+// maxProbe)]). A value ≤ the cheap nprobe disables escalation (the search stays
+// single-tier and bit-identical to before).
+func (ix *Index) SetNProbeHigh(np int) {
+	if np <= 0 {
+		ix.nprobeHigh = 0
+		return
+	}
+	if np > ix.nlist {
+		np = ix.nlist
+	}
+	if np > maxProbe {
+		np = maxProbe
+	}
+	ix.nprobeHigh = np
+}
+
+// SetTriggerRadius sets the squared-distance threshold on the cheap pass's 5th-NN
+// (topK.worst()) above which the query escalates to nprobeHigh. ≤0 leaves it
+// unchanged. Cross-bucket misses sit just above 1.0, so values near 1.0 fire
+// rarely; lower values fire more (and risk moving p99).
+func (ix *Index) SetTriggerRadius(r float64) {
+	if r <= 0 {
+		return
+	}
+	ix.triggerRadius = r
+}
+
+// SetTriggerMargin sets an optional AND-gate: escalate only when the cheap vote
+// is also near the 0.6 threshold (|fraudCount - K*Threshold| <= margin). A
+// negative margin disables the gate (radius alone decides).
+func (ix *Index) SetTriggerMargin(m float64) {
+	ix.triggerMargin = m
 }
 
 func (ix *Index) isFraud(i int) bool {
@@ -345,7 +389,7 @@ func (ix *Index) Score(query [Dims]float64) float64 {
 	if ix.n == 0 {
 		return 0
 	}
-	tk, _ := ix.searchTopK(&query)
+	tk, _, _ := ix.searchTopK(&query)
 	return tk.fraudScore()
 }
 
@@ -357,7 +401,7 @@ func (ix *Index) ScoreCount(query [Dims]float64) int {
 	if ix.n == 0 {
 		return 0
 	}
-	tk, _ := ix.searchTopK(&query)
+	tk, _, _ := ix.searchTopK(&query)
 	n := 0
 	for i := 0; i < K; i++ {
 		if tk.fraud[i] {
@@ -373,24 +417,71 @@ func (ix *Index) ScoreScan(query [Dims]float64) (float64, int) {
 	if ix.n == 0 {
 		return 0, 0
 	}
-	tk, scanned := ix.searchTopK(&query)
+	tk, scanned, _ := ix.searchTopK(&query)
 	return tk.fraudScore(), scanned
 }
 
-func (ix *Index) searchTopK(q *[Dims]float64) (topK, int) {
-	scanned := 0
+// ScoreScanEscalated is ScoreScan plus whether the adaptive high-nprobe pass
+// fired for this query (the diag harness uses it to report the escalation rate).
+// Diagnostic only.
+func (ix *Index) ScoreScanEscalated(query [Dims]float64) (float64, int, bool) {
+	if ix.n == 0 {
+		return 0, 0, false
+	}
+	tk, scanned, escalated := ix.searchTopK(&query)
+	return tk.fraudScore(), scanned, escalated
+}
 
-	// Quantize the query to the native grid once. The scan computes only INTEGER
-	// distances (int16 SIMD kernel) and collects the candK rows of smallest integer
-	// distance; the exact float64 5-NN is then refined from just those candidates.
+// searchTopK runs the cheap pass at ix.nprobe and, only when the result looks
+// like it could be wrong, re-runs the whole search at the higher ix.nprobeHigh.
+// The escalation trigger is the 5th-NN search radius (topK.worst()): residual
+// misses come exclusively from queries whose true 5-NN crosses a hard-bucket
+// boundary, which forces a squared-distance contribution ≥1.0, so a borderline
+// result has worst() near/above 1.0. With nprobeHigh disabled (≤nprobe) only the
+// cheap pass runs and the result is bit-identical to the single-tier search.
+func (ix *Index) searchTopK(q *[Dims]float64) (topK, int, bool) {
 	var qcode [Dims]int32
 	for i := 0; i < Dims; i++ {
 		qcode[i] = int32(quantize(q[i]))
 	}
 
+	tk, scanned := ix.searchAt(q, &qcode, ix.nprobe, ix.maxScan)
+
+	if ix.nprobeHigh > ix.nprobe && ix.shouldEscalate(&tk) {
+		// Escalate: the high pass is a strict superset of the cheap one, so the
+		// refined 5-NN can only improve. maxScan is disabled here — escalation is
+		// the "spend more" path and must never be truncated.
+		tk2, sc2 := ix.searchAt(q, &qcode, ix.nprobeHigh, 0)
+		return tk2, scanned + sc2, true
+	}
+	return tk, scanned, false
+}
+
+// shouldEscalate decides whether the cheap pass warrants the high-nprobe re-run.
+// Primary signal (triggerMargin>=0): the fraud vote sits within triggerMargin of
+// the 0.6 decision boundary (K*Threshold = 3 of 5) — the only queries whose exact
+// 5-NN could flip the approve/deny outcome, so the only ones where a residual
+// miss costs a failure. Measured on the real set: margin=1 (count 2..4) → E=0 at
+// ~3% escalation. The 5th-NN radius alone is a poor trigger (the approximate pass
+// inflates worst(), firing on ~34% while still missing real flips), so it is only
+// the fallback when the margin gate is disabled (triggerMargin<0).
+func (ix *Index) shouldEscalate(tk *topK) bool {
+	if ix.triggerMargin >= 0 {
+		return nearVote(tk, ix.triggerMargin)
+	}
+	return tk.worst() >= ix.triggerRadius
+}
+
+// searchAt runs one full IVF search (home bucket + admissible cross-buckets) at
+// the given nprobe and per-query scan cap, returning the exact 5-NN and the row
+// count scanned. Stack-only / zero-allocation; callers pass the pre-quantized
+// qcode so the two-tier dispatcher quantizes once.
+func (ix *Index) searchAt(q *[Dims]float64, qcode *[Dims]int32, np, capScan int) (topK, int) {
+	scanned := 0
+
 	col := newIntTopK()
 	b0 := bucketOf(q)
-	ix.probeBucket(q, &qcode, b0, &col, &scanned)
+	ix.probeBucket(q, qcode, b0, np, &col, &scanned, capScan)
 
 	// Cross-bucket: skip a bucket only when its forced penalty (a real-distance
 	// lower bound, scaled to integer ~*1e8) is beyond the worst collected candidate
@@ -400,13 +491,13 @@ func (ix *Index) searchTopK(q *[Dims]float64) (topK, int) {
 		if b == b0 {
 			continue
 		}
-		if ix.maxScan > 0 && scanned >= ix.maxScan {
+		if capScan > 0 && scanned >= capScan {
 			break
 		}
 		if col.full() && bucketPenalty(q, b)*1e8 >= float64(col.worst())+1e5 {
 			continue
 		}
-		ix.probeBucket(q, &qcode, b, &col, &scanned)
+		ix.probeBucket(q, qcode, b, np, &col, &scanned, capScan)
 	}
 
 	// Exact refine: float64 distance for the few collected candidates → exact 5-NN.
@@ -418,13 +509,28 @@ func (ix *Index) searchTopK(q *[Dims]float64) (topK, int) {
 	return tk, scanned
 }
 
+// nearVote reports whether the cheap pass's fraud vote is within `margin` of the
+// 0.6 decision boundary (K*Threshold = 3 of 5). Optional AND-gate for escalation.
+func nearVote(tk *topK, margin float64) bool {
+	n := 0
+	for i := 0; i < K; i++ {
+		if tk.fraud[i] {
+			n++
+		}
+	}
+	d := float64(n) - K*Threshold
+	if d < 0 {
+		d = -d
+	}
+	return d <= margin
+}
+
 // probeBucket scans the nprobe nearest cells of bucket b. Cell selection touches
 // only the nlist centroids (contiguous); the chosen cells are contiguous row
 // runs, so the candidate scan is prefetch-friendly.
-func (ix *Index) probeBucket(q *[Dims]float64, qcode *[Dims]int32, b int, col *intTopK, scanned *int) {
+func (ix *Index) probeBucket(q *[Dims]float64, qcode *[Dims]int32, b, np int, col *intTopK, scanned *int, capScan int) {
 	nlist := ix.nlist
 	base := b * nlist
-	np := ix.nprobe
 	if np > nlist {
 		np = nlist
 	}
@@ -485,7 +591,7 @@ func (ix *Index) probeBucket(q *[Dims]float64, qcode *[Dims]int32, b int, col *i
 		}
 		ix.scanCellCollect(qcode, sBase, bRows, lo-bLo, lo, m, col)
 		*scanned += m
-		if ix.maxScan > 0 && *scanned >= ix.maxScan {
+		if capScan > 0 && *scanned >= capScan {
 			return
 		}
 	}

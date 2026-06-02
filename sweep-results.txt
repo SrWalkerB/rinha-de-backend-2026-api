@@ -1,0 +1,7 @@
+=== LB CPU sweep 2026-06-02T08:17:53 (app = centroid-SIMD dev build) ===
+lb=0.10/api=0.45x2 | p99=156.3ms final=3354.5 Err=0 FP=10 FN=7 | bal a1/a2=70/66 skew=1.03x
+lb=0.15/api=0.425x2 | p99=167.7ms final=3328.06 Err=0 FP=9 FN=7 | bal a1/a2=33/33 skew=1x
+lb=0.20/api=0.40x2 | p99=1.16ms final=5483.1 Err=0 FP=10 FN=7 | bal a1/a2=64/64 skew=1x
+lb=0.25/api=0.375x2 | p99=1.15ms final=5488.49 Err=0 FP=10 FN=7 | bal a1/a2=48/48 skew=1x
+lb=0.30/api=0.35x2 | p99=1.21ms final=5467.08 Err=0 FP=10 FN=7 | bal a1/a2=41/42 skew=1.01x
+DONE 2026-06-02T08:29:23

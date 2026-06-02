@@ -44,7 +44,7 @@ func bruteTopK(ix *Index, q *[Dims]float64) topK {
 // top-5 (distances AND fraud labels) as the full brute scan.
 func assertExact(t *testing.T, ix *Index, q *[Dims]float64, label string) {
 	t.Helper()
-	got, _ := ix.searchTopK(q)
+	got, _, _ := ix.searchTopK(q)
 	want := bruteTopK(ix, q)
 	if got.dist != want.dist || got.fraud != want.fraud {
 		t.Fatalf("%s: partitioned 5-NN != brute\n got dist=%v fraud=%v\nwant dist=%v fraud=%v",
@@ -136,5 +136,42 @@ func TestMaxScanUnlimitedIsExact(t *testing.T) {
 	for j := 0; j < 300; j++ {
 		q := randVec(rng)
 		assertExact(t, ix, &q, "unlimited query")
+	}
+}
+
+// Adaptive two-tier: with a tiny cheap nprobe but escalation forced on (trigger
+// radius ~0 => every query re-runs at a high nprobe), the escalated path must
+// still reproduce the exact brute 5-NN, and escalation must actually fire.
+func TestAdaptiveEscalatedExact(t *testing.T) {
+	rng := rand.New(rand.NewSource(21))
+	const N, M, nlist = 12000, 1000, 16
+	rows := make([]row, N)
+	for i := range rows {
+		rows[i] = row{randVec(rng), rng.Float64() < 0.44}
+	}
+	b := NewBuilder(N, nlist, 5) // nlist>1 so a cheap nprobe leaves cells unscanned
+	for _, r := range rows {
+		b.Add(r.v, r.fraud)
+	}
+	ix := b.Build()
+	ix.SetNProbe(1)              // cheap pass scans only 1 of nlist cells/bucket
+	ix.SetTriggerRadius(1e-9)    // ...but every query escalates
+	ix.SetTriggerMargin(-1)      // radius alone decides
+	ix.SetNProbeHigh(nlist)      // high pass = full within-bucket => exact
+	fired := 0
+	for j := 0; j < M; j++ {
+		q := randVec(rng)
+		got, _, esc := ix.searchTopK(&q)
+		if esc {
+			fired++
+		}
+		want := bruteTopK(ix, &q)
+		if got.dist != want.dist || got.fraud != want.fraud {
+			t.Fatalf("escalated 5-NN != brute\n got dist=%v fraud=%v\nwant dist=%v fraud=%v",
+				got.dist, got.fraud, want.dist, want.fraud)
+		}
+	}
+	if fired == 0 {
+		t.Fatal("escalation never fired; adaptive path was not exercised")
 	}
 }
