@@ -14,9 +14,11 @@ name: rinha-fraud
 # ============================================================================
 
 x-api: &api
-  # IMAGEM 5.2 = nlist 1024 + high nprobe por voto + parser JSON direto.
-  # PUBLICAR antes do push: publish.ps1 -User srwalkerb -Tag 5.2
-  image: srwalkerb/rinha-fraud:5.2
+  # IMAGEM 5.3 = 5.2 (nlist 1024 + high nprobe por voto) + escalada INCREMENTAL:
+  # a passada escalada estende o mesmo col da barata e varre só as células novas
+  # [nprobe:nprobeHigh) — E byte-idêntico (provado no diag/oráculo), WORK p99 da
+  # query escalada −12%. PUBLICAR antes do push: publish.ps1 -User srwalkerb -Tag 5.3
+  image: srwalkerb/rinha-fraud:5.3
   pull_policy: always
   environment:
     ADDR: ":8080"
@@ -24,11 +26,16 @@ x-api: &api
     GOMEMLIMIT: "150MiB"
     # GC só dispara perto do limite de memória (live set ~88MB << 150MiB).
     GOGC: "off"
-    INDEX_NPROBE: "16"
-    INDEX_NPROBE_HIGH: "192"
-    INDEX_NPROBE_HIGH_C2: "192"
-    INDEX_NPROBE_HIGH_C3: "128"
-    INDEX_NPROBE_HIGH_C4: "64"
+    # Config 5.3 (sweep diag 2026-06-02, BRUTE_SAMPLE=15000): iguala a tightness da
+    # provada 32/328 (mismatches=6 → E=0 robusto no Mac) mas com WORK p99 −47%
+    # (106k vs 202k linhas) via high nprobe POR VOTO: count=2 (fronteira 0.4, mais
+    # propensa a flipar) leva o pesado 224; count=4 (0.8, longe) só 96. + escalada
+    # incremental do código (5.3). E=0/det=3000 no diag completo (54.100).
+    INDEX_NPROBE: "32"
+    INDEX_NPROBE_HIGH: "224"
+    INDEX_NPROBE_HIGH_C2: "224"
+    INDEX_NPROBE_HIGH_C3: "160"
+    INDEX_NPROBE_HIGH_C4: "96"
     INDEX_TRIGGER_MARGIN: "1"
   networks:
     - app
@@ -54,7 +61,7 @@ services:
   # que nginx (segura em 0.25 vs ~0.30 do nginx; STARVA <0.20 — joelho medido).
   # Balance api1/api2 ok (skew ~1.0x sob k6: RR-por-conexão equilibra com muitas VUs).
   lb:
-    image: srwalkerb/rinha-fraud:5.2
+    image: srwalkerb/rinha-fraud:5.3
     pull_policy: always
     entrypoint: ["/app/lb"]
     environment:

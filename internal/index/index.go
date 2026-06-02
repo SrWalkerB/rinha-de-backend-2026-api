@@ -496,7 +496,12 @@ func (ix *Index) searchTopKTrace(q *[Dims]float64) (topK, int, SearchTrace) {
 		qcode[i] = int32(quantize(q[i]))
 	}
 
-	tk, scanned := ix.searchAt(q, &qcode, ix.nprobe, ix.maxScan)
+	// Cheap pass: collect candidates from the cells ranked [0, nprobe) of every
+	// admissible bucket, then refine to the exact 5-NN for the vote / trigger.
+	col := newIntTopK()
+	scanned := 0
+	ix.scanRange(q, &qcode, 0, ix.nprobe, &col, &scanned, ix.maxScan)
+	tk := ix.refine(q, &col)
 	cheapCount := fraudCount(&tk)
 	trace := SearchTrace{
 		CheapFraudCount: cheapCount,
@@ -505,13 +510,18 @@ func (ix *Index) searchTopKTrace(q *[Dims]float64) (topK, int, SearchTrace) {
 
 	nprobeHigh := ix.highProbeForCount(cheapCount)
 	if nprobeHigh > ix.nprobe && ix.shouldEscalate(&tk) {
-		// Escalate: the high pass is a strict superset of the cheap one, so the
-		// refined 5-NN can only improve. maxScan is disabled here — escalation is
-		// the "spend more" path and must never be truncated.
-		tk2, sc2 := ix.searchAt(q, &qcode, nprobeHigh, 0)
+		// Escalate INCREMENTALLY: extend the SAME candidate collector with the new
+		// cells ranked [nprobe, nprobeHigh). The cheap cells [0, nprobe) are never
+		// re-scanned, so the candidate set equals a fresh nprobeHigh scan (identical
+		// 5-NN and detection) but the work excludes the already-scanned cheap cells.
+		// maxScan is disabled here — escalation is the "spend more" path and must
+		// never be truncated.
+		highScanned := 0
+		ix.scanRange(q, &qcode, ix.nprobe, nprobeHigh, &col, &highScanned, 0)
+		tk = ix.refine(q, &col)
 		trace.Escalated = true
-		trace.HighScanned = sc2
-		return tk2, scanned + sc2, trace
+		trace.HighScanned = highScanned
+		return tk, scanned + highScanned, trace
 	}
 	return tk, scanned, trace
 }
@@ -538,41 +548,44 @@ func (ix *Index) shouldEscalate(tk *topK) bool {
 	return tk.worst() >= ix.triggerRadius
 }
 
-// searchAt runs one full IVF search (home bucket + admissible cross-buckets) at
-// the given nprobe and per-query scan cap, returning the exact 5-NN and the row
-// count scanned. Stack-only / zero-allocation; callers pass the pre-quantized
-// qcode so the two-tier dispatcher quantizes once.
-func (ix *Index) searchAt(q *[Dims]float64, qcode *[Dims]int32, np, capScan int) (topK, int) {
-	scanned := 0
-
-	col := newIntTopK()
+// scanRange probes the home bucket and the admissible cross-buckets, scanning cells
+// ranked [npLo, npHi) of each into the shared candidate collector col, and adds the
+// rows visited to *scanned. Stack-only / zero-allocation; callers pass the
+// pre-quantized qcode so the two-tier dispatcher quantizes once.
+//
+// The cross-bucket prune is a conservative real-distance lower bound (scaled to
+// integer ~*1e8): it skips a bucket only when its forced penalty exceeds the worst
+// collected candidate by a safe margin (>= 1e5 covers the query-grid rounding
+// |d_int-d_float*1e8| <= sqrt(14*d_float)*1e4). Because the test never drops a bucket
+// that could hold a true top-candK row, the collected set — and the exact 5-NN
+// refined from it — is independent of probe order. That is what makes incremental
+// escalation safe: extending an existing col with the [nprobe, nprobeHigh) cells
+// yields the same candidates as a fresh [0, nprobeHigh) scan.
+func (ix *Index) scanRange(q *[Dims]float64, qcode *[Dims]int32, npLo, npHi int, col *intTopK, scanned *int, capScan int) {
 	b0 := bucketOf(q)
-	ix.probeBucket(q, qcode, b0, np, &col, &scanned, capScan)
-
-	// Cross-bucket: skip a bucket only when its forced penalty (a real-distance
-	// lower bound, scaled to integer ~*1e8) is beyond the worst collected candidate
-	// by a safe margin (>= 1e5 covers the query-grid rounding |d_int-d_float*1e8| <=
-	// sqrt(14*d_float)*1e4). Conservative — never drops a true top-5 bucket.
+	ix.probeBucketRange(q, qcode, b0, npLo, npHi, col, scanned, capScan)
 	for b := 0; b < numBuckets; b++ {
 		if b == b0 {
 			continue
 		}
-		if capScan > 0 && scanned >= capScan {
+		if capScan > 0 && *scanned >= capScan {
 			break
 		}
 		if col.full() && bucketPenalty(q, b)*1e8 >= float64(col.worst())+1e5 {
 			continue
 		}
-		ix.probeBucket(q, qcode, b, np, &col, &scanned, capScan)
+		ix.probeBucketRange(q, qcode, b, npLo, npHi, col, scanned, capScan)
 	}
+}
 
-	// Exact refine: float64 distance for the few collected candidates → exact 5-NN.
+// refine turns the collected integer-distance candidates into the exact float64 5-NN.
+func (ix *Index) refine(q *[Dims]float64, col *intTopK) topK {
 	tk := newTopK()
 	for i := 0; i < col.n; i++ {
 		row := int(col.row[i])
 		tk.consider(ix.dist2(q, row), ix.isFraud(row))
 	}
-	return tk, scanned
+	return tk
 }
 
 // nearVote reports whether the cheap pass's fraud vote is within `margin` of the
@@ -596,12 +609,22 @@ func fraudCount(tk *topK) int {
 	return n
 }
 
-// probeBucket scans the nprobe nearest cells of bucket b. Cell selection touches
-// only the nlist centroids (contiguous); the chosen cells are contiguous row
-// runs, so the candidate scan is prefetch-friendly.
-func (ix *Index) probeBucket(q *[Dims]float64, qcode *[Dims]int32, b, np int, col *intTopK, scanned *int, capScan int) {
+// probeBucketRange scans cells ranked [npLo, npHi) (by ascending centroid distance)
+// of bucket b — i.e. it selects the npHi nearest cells but scans only those whose
+// rank is >= npLo. Cell selection touches only the nlist centroids (contiguous); the
+// chosen cells are contiguous row runs, so the candidate scan is prefetch-friendly.
+//
+// Two-tier reuse: the cheap pass calls probeBucketRange(b, 0, nprobe); the escalated
+// pass calls probeBucketRange(b, nprobe, nprobeHigh) into the SAME candidate
+// collector. The nprobe nearest cells are a deterministic prefix of the npHi nearest
+// (insertProbe is order-stable), so the cheap pass already scanned ranks [0, nprobe)
+// and the escalation never re-scans them — it only adds the genuinely new cells
+// [nprobe, nprobeHigh). The final candidate set is identical to a single fresh scan
+// of the npHi nearest cells, so the exact 5-NN (and detection) is unchanged.
+func (ix *Index) probeBucketRange(q *[Dims]float64, qcode *[Dims]int32, b, npLo, npHi int, col *intTopK, scanned *int, capScan int) {
 	nlist := ix.nlist
 	base := b * nlist
+	np := npHi
 	if np > nlist {
 		np = nlist
 	}
@@ -610,6 +633,12 @@ func (ix *Index) probeBucket(q *[Dims]float64, qcode *[Dims]int32, b, np int, co
 	}
 	if np < 1 {
 		np = 1
+	}
+	if npLo < 0 {
+		npLo = 0
+	}
+	if npLo >= np {
+		return // nothing new to scan in this range
 	}
 
 	// Select the np nearest centroids by INTEGER (query-quantized) distance into stack
@@ -650,7 +679,7 @@ func (ix *Index) probeBucket(q *[Dims]float64, qcode *[Dims]int32, b, np int, co
 	bLo := int(ix.bucketStart[b])
 	bRows := int(ix.bucketStart[b+1]) - bLo
 	sBase := bLo * Dims
-	for i := 0; i < np; i++ {
+	for i := npLo; i < np; i++ {
 		if pd[i] == math.MaxInt32 {
 			break // fewer non-empty candidates than np
 		}
