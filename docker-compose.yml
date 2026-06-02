@@ -14,17 +14,21 @@ name: rinha-fraud
 # ============================================================================
 
 x-api: &api
-  image: srwalkerb/rinha-fraud:2.2
+  image: srwalkerb/rinha-fraud:2.3
   pull_policy: always
   environment:
     ADDR: ":8080"
-    GOMAXPROCS: "1"
+    # 1->2: cada api processa requests CONCORRENTES (fila M/M/1 -> M/M/2) -> corta
+    # a cauda do p99 no Mac. CPU/req igual (mesma cota 0.35). O Ryzen local nem
+    # forma fila (1.5ms), só o Haswell lento do Mac enfileira -> testar via prévia.
+    GOMAXPROCS: "2"
     GOMEMLIMIT: "150MiB"
     # GC só dispara perto do limite de memória (live set ~88MB << 150MiB).
     GOGC: "off"
-    # Células IVF varridas por bucket/query. Maior = mais recall (melhor
-    # detection_score), mais CPU. Sintonizar via testes de prévia: subir até o
-    # p99 no Mac Mini se aproximar de 1ms. Sem rebuild (knob de runtime).
+    # Células IVF varridas por query. np32 corta failures (E31->14, det +99) MAS
+    # ~2x CPU/query -> no Mac lento (api 0.35, ~64% ocupada @ np16) provavelmente
+    # SATURA (Err>0). Local nao mostra (Ryzen rapido). Manter 16; cortar failures
+    # via nprobe ADAPTATIVO (so queries de fronteira) depois. Runtime, sem rebuild.
     INDEX_NPROBE: "16"
   networks:
     - app
