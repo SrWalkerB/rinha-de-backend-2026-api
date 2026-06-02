@@ -18,10 +18,11 @@ x-api: &api
   pull_policy: always
   environment:
     ADDR: ":8080"
-    # 1->2: cada api processa requests CONCORRENTES (fila M/M/1 -> M/M/2) -> corta
-    # a cauda do p99 no Mac. CPU/req igual (mesma cota 0.35). O Ryzen local nem
-    # forma fila (1.5ms), só o Haswell lento do Mac enfileira -> testar via prévia.
-    GOMAXPROCS: "2"
+    # GOMAXPROCS=1 CASA com a cota de 0.35 CPU. Prévia v2.3 testou "2" -> p99 31->51ms
+    # PIOR: 2 threads queimam a cota CFS 2x mais rápido -> throttle mais cedo no
+    # período -> mais park. Regra: GOMAXPROCS <= ceil(cota). Menos fila vem de cortar
+    # CPU/query (GOAMD64=v3 na imagem), NÃO de mais threads num container <1 CPU.
+    GOMAXPROCS: "1"
     GOMEMLIMIT: "150MiB"
     # GC só dispara perto do limite de memória (live set ~88MB << 150MiB).
     GOGC: "off"
