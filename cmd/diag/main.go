@@ -150,6 +150,7 @@ func main() {
 	var escalated int
 	var vote [index.K + 1]voteStats
 	scanned := make([]int, pass1)
+	centEv := make([]int, pass1)
 	latNs := make([]int64, pass1)
 	start := time.Now()
 	for i := 0; i < pass1; i++ {
@@ -157,6 +158,7 @@ func main() {
 		score, sc, tr := ix.ScoreScanTrace(queries[i])
 		latNs[i] = time.Since(q0).Nanoseconds()
 		scanned[i] = sc
+		centEv[i] = tr.CheapCentroids + tr.HighCentroids
 		vs := &vote[tr.CheapFraudCount]
 		vs.total++
 		vs.scanned = append(vs.scanned, sc)
@@ -246,6 +248,10 @@ func main() {
 	log.Printf("================ WORK (reference rows scanned per query) ============")
 	log.Printf("  mean=%.0f  p50=%d  p99=%d  max=%d",
 		mean(scanned), scanned[pass1/2], scanned[pct(pass1, 99)], scanned[pass1-1])
+	sort.Ints(centEv)
+	log.Printf("================ CENTROID EVALS per query (nlist scans, NOT in WORK) =")
+	log.Printf("  mean=%.0f  p50=%d  p99=%d  max=%d",
+		mean(centEv), centEv[pass1/2], centEv[pct(pass1, 99)], centEv[pass1-1])
 }
 
 type voteStats struct {

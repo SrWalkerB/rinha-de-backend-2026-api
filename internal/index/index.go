@@ -196,6 +196,8 @@ type SearchTrace struct {
 	CheapFraudCount int
 	CheapScanned    int
 	HighScanned     int
+	CheapCentroids  int // centroid distances evaluated in the cheap pass (diag)
+	HighCentroids   int // centroid distances evaluated in the escalated pass (diag)
 }
 
 // Len reports how many reference vectors are stored.
@@ -500,12 +502,14 @@ func (ix *Index) searchTopKTrace(q *[Dims]float64) (topK, int, SearchTrace) {
 	// admissible bucket, then refine to the exact 5-NN for the vote / trigger.
 	col := newIntTopK()
 	scanned := 0
-	ix.scanRange(q, &qcode, 0, ix.nprobe, &col, &scanned, ix.maxScan)
+	cheapCent := 0
+	ix.scanRange(q, &qcode, 0, ix.nprobe, &col, &scanned, &cheapCent, ix.maxScan)
 	tk := ix.refine(q, &col)
 	cheapCount := fraudCount(&tk)
 	trace := SearchTrace{
 		CheapFraudCount: cheapCount,
 		CheapScanned:    scanned,
+		CheapCentroids:  cheapCent,
 	}
 
 	nprobeHigh := ix.highProbeForCount(cheapCount)
@@ -517,10 +521,12 @@ func (ix *Index) searchTopKTrace(q *[Dims]float64) (topK, int, SearchTrace) {
 		// maxScan is disabled here — escalation is the "spend more" path and must
 		// never be truncated.
 		highScanned := 0
-		ix.scanRange(q, &qcode, ix.nprobe, nprobeHigh, &col, &highScanned, 0)
+		highCent := 0
+		ix.scanRange(q, &qcode, ix.nprobe, nprobeHigh, &col, &highScanned, &highCent, 0)
 		tk = ix.refine(q, &col)
 		trace.Escalated = true
 		trace.HighScanned = highScanned
+		trace.HighCentroids = highCent
 		return tk, scanned + highScanned, trace
 	}
 	return tk, scanned, trace
@@ -561,9 +567,9 @@ func (ix *Index) shouldEscalate(tk *topK) bool {
 // refined from it — is independent of probe order. That is what makes incremental
 // escalation safe: extending an existing col with the [nprobe, nprobeHigh) cells
 // yields the same candidates as a fresh [0, nprobeHigh) scan.
-func (ix *Index) scanRange(q *[Dims]float64, qcode *[Dims]int32, npLo, npHi int, col *intTopK, scanned *int, capScan int) {
+func (ix *Index) scanRange(q *[Dims]float64, qcode *[Dims]int32, npLo, npHi int, col *intTopK, scanned, centEvals *int, capScan int) {
 	b0 := bucketOf(q)
-	ix.probeBucketRange(q, qcode, b0, npLo, npHi, col, scanned, capScan)
+	ix.probeBucketRange(q, qcode, b0, npLo, npHi, col, scanned, centEvals, capScan)
 	for b := 0; b < numBuckets; b++ {
 		if b == b0 {
 			continue
@@ -574,7 +580,7 @@ func (ix *Index) scanRange(q *[Dims]float64, qcode *[Dims]int32, npLo, npHi int,
 		if col.full() && bucketPenalty(q, b)*1e8 >= float64(col.worst())+1e5 {
 			continue
 		}
-		ix.probeBucketRange(q, qcode, b, npLo, npHi, col, scanned, capScan)
+		ix.probeBucketRange(q, qcode, b, npLo, npHi, col, scanned, centEvals, capScan)
 	}
 }
 
@@ -621,9 +627,10 @@ func fraudCount(tk *topK) int {
 // and the escalation never re-scans them — it only adds the genuinely new cells
 // [nprobe, nprobeHigh). The final candidate set is identical to a single fresh scan
 // of the npHi nearest cells, so the exact 5-NN (and detection) is unchanged.
-func (ix *Index) probeBucketRange(q *[Dims]float64, qcode *[Dims]int32, b, npLo, npHi int, col *intTopK, scanned *int, capScan int) {
+func (ix *Index) probeBucketRange(q *[Dims]float64, qcode *[Dims]int32, b, npLo, npHi int, col *intTopK, scanned, centEvals *int, capScan int) {
 	nlist := ix.nlist
 	base := b * nlist
+	*centEvals += nlist // every probe scans all nlist centroids to select the cells
 	np := npHi
 	if np > nlist {
 		np = nlist
