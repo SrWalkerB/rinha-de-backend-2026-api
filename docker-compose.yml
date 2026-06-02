@@ -14,7 +14,7 @@ name: rinha-fraud
 # ============================================================================
 
 x-api: &api
-  image: srwalkerb/rinha-fraud:2.1
+  image: srwalkerb/rinha-fraud:2.2
   pull_policy: always
   environment:
     ADDR: ":8080"
@@ -31,7 +31,12 @@ x-api: &api
   deploy:
     resources:
       limits:
-        cpus: "0.45"
+        # p99 era throttle CFS por SUB-PROVISÃO. Sweep local (k6, img 2.1) achou um
+        # U: precisa alimentar OS DOIS. nginx<~0.3 -> nginx trava (p99 ~1100ms);
+        # api<~0.3 -> api trava (p99 ~960ms); ambos >=~0.3 -> p99 despenca (dezenas
+        # de ms, Err=0). Split: nginx 0.30 + api 0.35x2 = 1.00. api 0.35 dá folga
+        # pra subir nprobe depois (detecção) sem voltar a travar.
+        cpus: "0.35"
         memory: "155MB"
 
 services:
@@ -55,7 +60,9 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.10"
+          # 0.10 -> 0.30: tira o throttle (cota CFS 10ms -> 30ms/100ms). Acima de
+          # ~0.3 não ganha mais (ver sweep); o resto vai pras apis.
+          cpus: "0.30"
           memory: "40MB"
 
 networks:
