@@ -92,6 +92,29 @@ func TestScoreFraudPayload(t *testing.T) {
 	}
 }
 
+func TestVectorizeJSONMatchesPayloadVectorize(t *testing.T) {
+	vec := testVectorizer()
+	var p vectorize.Payload
+	if err := json.Unmarshal([]byte(fraudBody), &p); err != nil {
+		t.Fatal(err)
+	}
+	want := vec.Vectorize(&p)
+	got, err := vec.VectorizeJSON([]byte(fraudBody))
+	if err != nil {
+		t.Fatalf("VectorizeJSON: %v", err)
+	}
+	if got != want {
+		t.Fatalf("VectorizeJSON = %v, want %v", got, want)
+	}
+}
+
+func TestVectorizeJSONMalformedFails(t *testing.T) {
+	vec := testVectorizer()
+	if _, err := vec.VectorizeJSON([]byte("{bad")); err == nil {
+		t.Fatal("VectorizeJSON malformed err = nil, want error")
+	}
+}
+
 // Malformed body must still return 200 with a safe fallback (avoid HTTP error
 // penalty, which AVALIACAO.md weights heaviest).
 func TestScoreMalformedBodyFallsBack(t *testing.T) {

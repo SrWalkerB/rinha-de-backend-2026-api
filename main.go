@@ -67,20 +67,9 @@ func buildResponses() [index.K + 1][]byte {
 // Header().Set) to avoid the one-element slice Set allocates per call.
 var contentTypeJSON = []string{"application/json"}
 
-// bufPool reuses request-body buffers; payloadPool reuses decoded payloads. Both
-// keep the request path allocation-light so the heap stays flat: with GOGC=off the
+// bufPool reuses request-body buffers so the heap stays flat: with GOGC=off the
 // GOMEMLIMIT pacer then never arms, removing the GC/CFS-throttle p99 stalls.
 var bufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
-var payloadPool = sync.Pool{New: func() any { return new(vectorize.Payload) }}
-
-// putPayload zeroes the payload (so a later Unmarshal can't inherit stale fields)
-// while keeping the KnownMerchants backing array, which json.Unmarshal reuses.
-func putPayload(p *vectorize.Payload) {
-	km := p.Customer.KnownMerchants[:0]
-	*p = vectorize.Payload{}
-	p.Customer.KnownMerchants = km
-	payloadPool.Put(p)
-}
 
 func (s *server) handleReady(w http.ResponseWriter, _ *http.Request) {
 	if s.ready.Load() {
@@ -106,9 +95,8 @@ func (s *server) handleScore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	p := payloadPool.Get().(*vectorize.Payload)
-	defer putPayload(p)
-	if err := json.Unmarshal(buf.Bytes(), p); err != nil {
+	q, err := s.vec.VectorizeJSON(buf.Bytes())
+	if err != nil {
 		writeBody(w, fallbackBody)
 		return
 	}
@@ -119,7 +107,7 @@ func (s *server) handleScore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeBody(w, responseBody[ix.ScoreCount(s.vec.Vectorize(p))])
+	writeBody(w, responseBody[ix.ScoreCount(q)])
 }
 
 func writeBody(w http.ResponseWriter, body []byte) {
@@ -175,12 +163,12 @@ func main() {
 
 	refPath := getenv("REFERENCES_PATH", "./resources/references.json.gz")
 	capHint := atoiEnv("REFERENCES_CAPACITY", 3_000_000)
-	nprobe := atoiEnv("INDEX_NPROBE", 16)   // cheap-tier cells scanned per bucket per query
+	nprobe := atoiEnv("INDEX_NPROBE", 32)   // cheap-tier cells scanned per bucket per query
 	maxScan := atoiEnv("INDEX_MAX_SCAN", 0) // 0 = unlimited; tail guardrail
 	// Adaptive (two-tier) nprobe: a query whose cheap-pass 5th-NN radius reaches
 	// TRIGGER_RADIUS re-runs at NPROBE_HIGH (drives the cross-bucket misses to 0
 	// while only escalating the rare borderline query). HIGH≤NPROBE disables it.
-	nprobeHigh := atoiEnv("INDEX_NPROBE_HIGH", 192)
+	nprobeHigh := atoiEnv("INDEX_NPROBE_HIGH", 328)
 	// Margin gate (primary): escalate when the cheap vote is within this many votes
 	// of the 0.6 boundary (count 2..4). Measured E=0 at ~3% escalation. Radius is the
 	// fallback gate, used only when margin<0.

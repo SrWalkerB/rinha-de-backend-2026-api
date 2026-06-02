@@ -27,6 +27,7 @@ go.work.sum
 
 # Índice de busca pré-construído (regenerado por cmd/buildindex / Docker build)
 resources/index.bin
+resources/index-*.bin
 
 # Dataset de 3M vetores: grande, copiado no build, nunca commitado
 resources/references.json.gz

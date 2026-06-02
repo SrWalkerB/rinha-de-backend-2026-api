@@ -44,7 +44,7 @@ const numBuckets = 16
 
 // maxProbe caps nprobe (low AND high tier) so the per-query probe buffer lives
 // on the stack (zero-allocation Score). nprobe and nprobeHigh are clamped to this.
-const maxProbe = 256
+const maxProbe = 512
 
 // simdTailPad is the number of zero uint16 appended after the SoA data array so
 // the int16 SIMD kernel's last 8-row m128 load can never read past the slice.
@@ -157,8 +157,8 @@ func bucketPenalty(q *[Dims]float64, target int) float64 {
 // bitset, the per-bucket k-means centroids, and CSR cell offsets. Build it with a
 // Builder (or LoadIndex); Score is then safe for concurrent callers.
 type Index struct {
-	data      []uint16  // n*Dims quantized, reordered by (bucket, cell)
-	fraud     []uint64  // fraud bitset over reordered rows
+	data      []uint16 // n*Dims quantized, reordered by (bucket, cell)
+	fraud     []uint64 // fraud bitset over reordered rows
 	n         int
 	nlist     int       // k-means cells per bucket
 	centroids []float64 // numBuckets*nlist*Dims, in the dequantized value space
@@ -186,6 +186,15 @@ type Index struct {
 	nprobeHigh    int     // cells/bucket for the escalated pass (0/<=nprobe = off)
 	triggerRadius float64 // escalate when topK.worst() >= this (squared distance)
 	triggerMargin float64 // optional AND-gate: also require |count-K*Threshold|<=margin (<0 = off)
+}
+
+// SearchTrace describes the two-tier search decision. It is diagnostic-only and
+// is intentionally not used by the serving hot path.
+type SearchTrace struct {
+	Escalated       bool
+	CheapFraudCount int
+	CheapScanned    int
+	HighScanned     int
 }
 
 // Len reports how many reference vectors are stored.
@@ -432,6 +441,16 @@ func (ix *Index) ScoreScanEscalated(query [Dims]float64) (float64, int, bool) {
 	return tk.fraudScore(), scanned, escalated
 }
 
+// ScoreScanTrace is ScoreScan with the cheap-pass vote and per-tier scan counts.
+// Diagnostic only.
+func (ix *Index) ScoreScanTrace(query [Dims]float64) (float64, int, SearchTrace) {
+	if ix.n == 0 {
+		return 0, 0, SearchTrace{}
+	}
+	tk, scanned, trace := ix.searchTopKTrace(&query)
+	return tk.fraudScore(), scanned, trace
+}
+
 // searchTopK runs the cheap pass at ix.nprobe and, only when the result looks
 // like it could be wrong, re-runs the whole search at the higher ix.nprobeHigh.
 // The escalation trigger is the 5th-NN search radius (topK.worst()): residual
@@ -440,21 +459,32 @@ func (ix *Index) ScoreScanEscalated(query [Dims]float64) (float64, int, bool) {
 // result has worst() near/above 1.0. With nprobeHigh disabled (≤nprobe) only the
 // cheap pass runs and the result is bit-identical to the single-tier search.
 func (ix *Index) searchTopK(q *[Dims]float64) (topK, int, bool) {
+	tk, scanned, trace := ix.searchTopKTrace(q)
+	return tk, scanned, trace.Escalated
+}
+
+func (ix *Index) searchTopKTrace(q *[Dims]float64) (topK, int, SearchTrace) {
 	var qcode [Dims]int32
 	for i := 0; i < Dims; i++ {
 		qcode[i] = int32(quantize(q[i]))
 	}
 
 	tk, scanned := ix.searchAt(q, &qcode, ix.nprobe, ix.maxScan)
+	trace := SearchTrace{
+		CheapFraudCount: fraudCount(&tk),
+		CheapScanned:    scanned,
+	}
 
 	if ix.nprobeHigh > ix.nprobe && ix.shouldEscalate(&tk) {
 		// Escalate: the high pass is a strict superset of the cheap one, so the
 		// refined 5-NN can only improve. maxScan is disabled here — escalation is
 		// the "spend more" path and must never be truncated.
 		tk2, sc2 := ix.searchAt(q, &qcode, ix.nprobeHigh, 0)
-		return tk2, scanned + sc2, true
+		trace.Escalated = true
+		trace.HighScanned = sc2
+		return tk2, scanned + sc2, trace
 	}
-	return tk, scanned, false
+	return tk, scanned, trace
 }
 
 // shouldEscalate decides whether the cheap pass warrants the high-nprobe re-run.
@@ -512,17 +542,22 @@ func (ix *Index) searchAt(q *[Dims]float64, qcode *[Dims]int32, np, capScan int)
 // nearVote reports whether the cheap pass's fraud vote is within `margin` of the
 // 0.6 decision boundary (K*Threshold = 3 of 5). Optional AND-gate for escalation.
 func nearVote(tk *topK, margin float64) bool {
+	n := fraudCount(tk)
+	d := float64(n) - K*Threshold
+	if d < 0 {
+		d = -d
+	}
+	return d <= margin
+}
+
+func fraudCount(tk *topK) int {
 	n := 0
 	for i := 0; i < K; i++ {
 		if tk.fraud[i] {
 			n++
 		}
 	}
-	d := float64(n) - K*Threshold
-	if d < 0 {
-		d = -d
-	}
-	return d <= margin
+	return n
 }
 
 // probeBucket scans the nprobe nearest cells of bucket b. Cell selection touches
@@ -653,8 +688,8 @@ func newIntTopK() intTopK {
 	return t
 }
 
-func (t *intTopK) full() bool    { return t.n >= candK }
-func (t *intTopK) worst() int32  { return t.dist[candK-1] }
+func (t *intTopK) full() bool   { return t.n >= candK }
+func (t *intTopK) worst() int32 { return t.dist[candK-1] }
 
 // consider inserts (d, row) if it beats the current candK-th smallest. Strict `<`
 // (first-seen wins ties) so the candidate set is deterministic.

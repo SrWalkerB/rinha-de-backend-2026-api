@@ -154,10 +154,10 @@ func TestAdaptiveEscalatedExact(t *testing.T) {
 		b.Add(r.v, r.fraud)
 	}
 	ix := b.Build()
-	ix.SetNProbe(1)              // cheap pass scans only 1 of nlist cells/bucket
-	ix.SetTriggerRadius(1e-9)    // ...but every query escalates
-	ix.SetTriggerMargin(-1)      // radius alone decides
-	ix.SetNProbeHigh(nlist)      // high pass = full within-bucket => exact
+	ix.SetNProbe(1)           // cheap pass scans only 1 of nlist cells/bucket
+	ix.SetTriggerRadius(1e-9) // ...but every query escalates
+	ix.SetTriggerMargin(-1)   // radius alone decides
+	ix.SetNProbeHigh(nlist)   // high pass = full within-bucket => exact
 	fired := 0
 	for j := 0; j < M; j++ {
 		q := randVec(rng)
@@ -173,5 +173,51 @@ func TestAdaptiveEscalatedExact(t *testing.T) {
 	}
 	if fired == 0 {
 		t.Fatal("escalation never fired; adaptive path was not exercised")
+	}
+}
+
+func TestScoreScanTraceReportsCheapVote(t *testing.T) {
+	rng := rand.New(rand.NewSource(22))
+	const N, nlist = 12000, 16
+	rows := make([]row, N)
+	for i := range rows {
+		rows[i] = row{randVec(rng), rng.Float64() < 0.44}
+	}
+	b := NewBuilder(N, nlist, 5)
+	for _, r := range rows {
+		b.Add(r.v, r.fraud)
+	}
+	ix := b.Build()
+	ix.SetNProbe(1)
+	ix.SetTriggerRadius(1e-9)
+	ix.SetTriggerMargin(-1)
+	ix.SetNProbeHigh(nlist)
+
+	q := randVec(rng)
+	score, scanned, tr := ix.ScoreScanTrace(q)
+	if !tr.Escalated {
+		t.Fatal("trace did not report forced escalation")
+	}
+	if tr.CheapFraudCount < 0 || tr.CheapFraudCount > K {
+		t.Fatalf("cheap fraud count = %d, want 0..%d", tr.CheapFraudCount, K)
+	}
+	if scanned <= 0 || tr.CheapScanned <= 0 || tr.HighScanned <= 0 {
+		t.Fatalf("scan counts not populated: scanned=%d trace=%+v", scanned, tr)
+	}
+	if score < 0 || score > 1 {
+		t.Fatalf("score = %v, want [0,1]", score)
+	}
+}
+
+func TestNProbeHighAllowsWideEscalation(t *testing.T) {
+	b := NewBuilder(10, 512, 1)
+	for i := 0; i < 10; i++ {
+		b.Add(randVec(rand.New(rand.NewSource(int64(i)))), false)
+	}
+	ix := b.Build()
+	ix.SetNProbe(16)
+	ix.SetNProbeHigh(512)
+	if ix.nprobeHigh != 512 {
+		t.Fatalf("nprobeHigh = %d, want 512", ix.nprobeHigh)
 	}
 }

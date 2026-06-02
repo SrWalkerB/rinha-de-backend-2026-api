@@ -145,23 +145,31 @@ func main() {
 	// --- Pass 1: partitioned Score over entries (failures, latency, scan) ---
 	var fp, fn int
 	var escalated int
+	var vote [index.K + 1]voteStats
 	scanned := make([]int, pass1)
 	latNs := make([]int64, pass1)
 	start := time.Now()
 	for i := 0; i < pass1; i++ {
 		q0 := time.Now()
-		score, sc, esc := ix.ScoreScanEscalated(queries[i])
+		score, sc, tr := ix.ScoreScanTrace(queries[i])
 		latNs[i] = time.Since(q0).Nanoseconds()
 		scanned[i] = sc
-		if esc {
+		vs := &vote[tr.CheapFraudCount]
+		vs.total++
+		vs.scanned = append(vs.scanned, sc)
+		if tr.Escalated {
 			escalated++
+			vs.escalated++
+			vs.highRows += tr.HighScanned
 		}
 		approved := score < index.Threshold
 		if approved != td.Entries[i].ExpectedApproved {
 			if approved { // approved a fraud → false negative
 				fn++
+				vs.fn++
 			} else { // denied a legit → false positive
 				fp++
+				vs.fp++
 			}
 		}
 	}
@@ -214,6 +222,16 @@ func main() {
 	log.Printf("  detection_score ~= %.1f  (cap +3000 at E=0)", detScore)
 	log.Printf("  escalated=%d  (%.2f%% of queries hit the high-nprobe pass)",
 		escalated, float64(escalated)/float64(pass1)*100)
+	log.Printf("================ CHEAP VOTE BREAKDOWN ==============================")
+	for i := 0; i <= index.K; i++ {
+		vs := &vote[i]
+		if vs.total == 0 {
+			continue
+		}
+		sort.Ints(vs.scanned)
+		log.Printf("  cheapCount=%d total=%d escalated=%d fp=%d fn=%d highRowsMean=%.0f rowsP99=%d",
+			i, vs.total, vs.escalated, vs.fp, vs.fn, safeMeanRows(vs.highRows, vs.escalated), vs.scanned[pct(len(vs.scanned), 99)])
+	}
 	log.Printf("================ EXACTNESS (partitioned vs brute oracle) ============")
 	log.Printf("  checked=%d  mismatches=%d  (want 0 => partitioned == exact 5-NN)", len(kth), mismatch)
 	log.Printf("================ 5th-NN squared distance (search radius) ============")
@@ -225,6 +243,15 @@ func main() {
 	log.Printf("================ WORK (reference rows scanned per query) ============")
 	log.Printf("  mean=%.0f  p50=%d  p99=%d  max=%d",
 		mean(scanned), scanned[pass1/2], scanned[pct(pass1, 99)], scanned[pass1-1])
+}
+
+type voteStats struct {
+	total     int
+	escalated int
+	fp        int
+	fn        int
+	highRows  int
+	scanned   []int
 }
 
 func us(ns int64) float64 { return float64(ns) / 1000 }
@@ -243,6 +270,13 @@ func mean(xs []int) float64 {
 		s += float64(x)
 	}
 	return s / float64(len(xs))
+}
+
+func safeMeanRows(rows, n int) float64 {
+	if n == 0 {
+		return 0
+	}
+	return float64(rows) / float64(n)
 }
 
 // detectionScore mirrors AVALIACAO.md: 1000·log10(1/max(eps,0.001)) − 300·log10(1+E).
