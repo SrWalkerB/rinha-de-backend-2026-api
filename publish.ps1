@@ -7,23 +7,19 @@
     Seu usuário do Docker Hub (minúsculo). Ex.: srwalkerb
 
 .PARAMETER Tag
-    Tag da imagem (default: 1.0).
-
-.PARAMETER NList
-    nlist do índice IVF cozido no build (default: 4096). Maior = p99 menor, build mais lento.
+    Tag da imagem (default: 2.0). Use uma TAG NOVA a cada push pra evitar cache da
+    engine e CASAR com submission/docker-compose.yml.
 
 .PARAMETER SkipPush
     Só builda (não faz push) — pra testar localmente antes.
 
 .EXAMPLE
-    .\publish.ps1 -User srwalkerb
-    .\publish.ps1 -User srwalkerb -Tag 1.1 -NList 8192
+    .\publish.ps1 -User srwalkerb -Tag 2.0
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$User,
-    [string]$Tag = '1.0',
-    [int]$NList = 4096,
+    [string]$Tag = '2.0',
     [switch]$SkipPush
 )
 
@@ -36,11 +32,10 @@ try {
         throw "Falta resources\references.json.gz — necessário no build pra cozinhar o index.bin."
     }
 
-    Write-Host "`n=== Build $image (linux/amd64, nlist=$NList) ===" -ForegroundColor Cyan
+    Write-Host "`n=== Build $image (linux/amd64; IVF nlist baked = 1024) ===" -ForegroundColor Cyan
     # --platform garante linux/amd64 (host de avaliação é Mac Mini Haswell amd64).
-    docker build --platform linux/amd64 `
-        --build-arg KNN_NLIST=$NList `
-        -t $image .
+    # O índice IVF (nlist=1024) é cozido pelo buildindex dentro do Dockerfile.
+    docker build --platform linux/amd64 -t $image .
     if ($LASTEXITCODE -ne 0) { throw 'docker build falhou' }
 
     if ($SkipPush) {
