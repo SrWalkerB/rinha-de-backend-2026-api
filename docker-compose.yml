@@ -14,8 +14,8 @@ name: rinha-fraud
 # ============================================================================
 
 x-api: &api
-  # IMAGEM 5.1 = nlist 4096 + high nprobe 328 + parser JSON direto.
-  image: srwalkerb/rinha-fraud:5.1
+  # IMAGEM 5.2 = nlist 1024 + high nprobe por voto + parser JSON direto.
+  image: srwalkerb/rinha-fraud:5.2
   pull_policy: always
   environment:
     ADDR: ":8080"
@@ -23,8 +23,11 @@ x-api: &api
     GOMEMLIMIT: "150MiB"
     # GC só dispara perto do limite de memória (live set ~88MB << 150MiB).
     GOGC: "off"
-    INDEX_NPROBE: "32"
-    INDEX_NPROBE_HIGH: "328"
+    INDEX_NPROBE: "16"
+    INDEX_NPROBE_HIGH: "192"
+    INDEX_NPROBE_HIGH_C2: "192"
+    INDEX_NPROBE_HIGH_C3: "128"
+    INDEX_NPROBE_HIGH_C4: "64"
     INDEX_TRIGGER_MARGIN: "1"
   networks:
     - app
@@ -50,7 +53,7 @@ services:
   # que nginx (segura em 0.25 vs ~0.30 do nginx; STARVA <0.20 — joelho medido).
   # Balance api1/api2 ok (skew ~1.0x sob k6: RR-por-conexão equilibra com muitas VUs).
   lb:
-    image: srwalkerb/rinha-fraud:5.1
+    image: srwalkerb/rinha-fraud:5.2
     pull_policy: always
     entrypoint: ["/app/lb"]
     environment:
