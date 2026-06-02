@@ -14,7 +14,7 @@ name: rinha-fraud
 # ============================================================================
 
 x-api: &api
-  image: srwalkerb/rinha-fraud:2.1
+  image: srwalkerb/rinha-fraud:2.2
   pull_policy: always
   environment:
     ADDR: ":8080"
