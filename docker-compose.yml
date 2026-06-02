@@ -24,7 +24,7 @@ x-api: &api
     # GC só dispara perto do limite de memória (live set ~88MB << 150MiB).
     GOGC: "off"
     INDEX_NPROBE: "16"
-    INDEX_NPROBE_HIGH: "128"
+    INDEX_NPROBE_HIGH: "64"
     INDEX_TRIGGER_MARGIN: "1"
   networks:
     - app
