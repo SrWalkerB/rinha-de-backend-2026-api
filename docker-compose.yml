@@ -14,34 +14,27 @@ name: rinha-fraud
 # ============================================================================
 
 x-api: &api
-  image: srwalkerb/rinha-fraud:2.2
+  # IMAGEM 4.0 = centroid-SIMD (int16 SoA cell-selection) + /app/lb embutido.
+  # PUBLICAR antes do push: publish.ps1 -User srwalkerb -Tag 4.0  (ainda não publicada).
+  image: srwalkerb/rinha-fraud:4.0
   pull_policy: always
   environment:
     ADDR: ":8080"
-    # GOMAXPROCS=1 CASA com a cota de 0.35 CPU. Prévia v2.3 testou "2" -> p99 31->51ms
-    # PIOR: 2 threads queimam a cota CFS 2x mais rápido -> throttle mais cedo no
-    # período -> mais park. Regra: GOMAXPROCS <= ceil(cota), nunca acima num
-    # container <1 CPU. (v3/AVX2 tbm testado e revertido: Go não auto-vetoriza.)
     GOMAXPROCS: "1"
     GOMEMLIMIT: "150MiB"
     # GC só dispara perto do limite de memória (live set ~88MB << 150MiB).
     GOGC: "off"
-    # Células IVF varridas por query. np32 corta failures (E31->14, det +99) MAS
-    # ~2x CPU/query -> no Mac lento (api 0.35, ~64% ocupada @ np16) provavelmente
-    # SATURA (Err>0). Local nao mostra (Ryzen rapido). Manter 16; cortar failures
-    # via nprobe ADAPTATIVO (so queries de fronteira) depois. Runtime, sem rebuild.
     INDEX_NPROBE: "16"
   networks:
     - app
   deploy:
     resources:
       limits:
-        # p99 era throttle CFS por SUB-PROVISÃO. Sweep local (k6, img 2.1) achou um
-        # U: precisa alimentar OS DOIS. nginx<~0.3 -> nginx trava (p99 ~1100ms);
-        # api<~0.3 -> api trava (p99 ~960ms); ambos >=~0.3 -> p99 despenca (dezenas
-        # de ms, Err=0). Split: nginx 0.30 + api 0.35x2 = 1.00. api 0.35 dá folga
-        # pra subir nprobe depois (detecção) sem voltar a travar.
-        cpus: "0.35"
+        # CPU sweep (2026-06-02, app centroid-SIMD): o LB L4 STARVA <0.20 (joelho) —
+        # lb0.10 deu p99 156ms/final 3354 (= regressão da 3.0). Em lb>=0.20 o p99
+        # colapsa. Config: lb 0.25 / api 0.375x2 = 1.00 (lb folgado acima do joelho
+        # p/ slack do CFS do Mac; api 0.375 > 0.35 do nginx, alimenta o scoring).
+        cpus: "0.375"
         memory: "155MB"
 
 services:
@@ -51,10 +44,17 @@ services:
   api2:
     <<: *api
 
-  nginx:
-    image: nginx:1.27-alpine
-    volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+  # LB próprio (L4 splice) no lugar do nginx — mesma imagem, entrypoint /app/lb.
+  # Satisfaz "≥1 load balancer + ≥2 instâncias" (é um LB, só não-nginx). Mais leve
+  # que nginx (segura em 0.25 vs ~0.30 do nginx; STARVA <0.20 — joelho medido).
+  # Balance api1/api2 ok (skew ~1.0x sob k6: RR-por-conexão equilibra com muitas VUs).
+  lb:
+    image: srwalkerb/rinha-fraud:4.0
+    pull_policy: always
+    entrypoint: ["/app/lb"]
+    environment:
+      LB_ADDR: ":9999"
+      LB_BACKENDS: "api1:8080,api2:8080"
     ports:
       - "9999:9999"
     depends_on:
@@ -65,10 +65,8 @@ services:
     deploy:
       resources:
         limits:
-          # 0.10 -> 0.30: tira o throttle (cota CFS 10ms -> 30ms/100ms). Acima de
-          # ~0.3 não ganha mais (ver sweep); o resto vai pras apis.
-          cpus: "0.30"
-          memory: "40MB"
+          cpus: "0.25"
+          memory: "32MB"
 
 networks:
   app:
