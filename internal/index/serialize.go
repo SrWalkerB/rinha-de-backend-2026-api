@@ -150,6 +150,9 @@ func readFrom(r io.Reader) (*Index, error) {
 		nprobe:    int(nlist),
 	}
 	copy(ix.bucketStart[:], bucketStart)
+	// centroidsI16 is derived, not serialized — build it from the loaded centroids so
+	// the int16 cell-selection scan works on a loaded index (no format bump).
+	ix.buildCentroidI16()
 	return ix, nil
 }
 

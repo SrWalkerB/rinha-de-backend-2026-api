@@ -319,6 +319,49 @@ func BenchmarkSoAScanF64(b *testing.B) {
 	}
 }
 
+// TestCentroidSelectSIMDMatchesScalar builds a real multi-cell index (nlist=16 →
+// exercises both the int16 kernel blocks and the <8 scalar tail of the centroid
+// scan) and asserts the SIMD cell-selection path produces bit-identical Score to the
+// forced-scalar path over many queries. Both the centroid scan and the row scan are
+// integer-exact (kernel == scalar int), and the float64 refine is identical, so the
+// whole search must agree — this guards the new probeBucket int selection.
+func TestCentroidSelectSIMDMatchesScalar(t *testing.T) {
+	if !useSIMD {
+		t.Skip("AVX2 unavailable on this CPU")
+	}
+	rng := rand.New(rand.NewSource(42))
+	b := NewBuilder(2000, 16, 5)
+	for i := 0; i < 2000; i++ {
+		var v [Dims]float64
+		for d := 0; d < Dims; d++ {
+			v[d] = rng.Float64()
+		}
+		v[9], v[10], v[11] = 0, 0, 0          // pin discrete dims → one bucket
+		v[5], v[6] = rng.Float64(), rng.Float64() // present last_transaction
+		b.Add(v, i%3 == 0)
+	}
+	ix := b.Build()
+	ix.SetNProbe(4)
+
+	saved := useSIMD
+	defer func() { useSIMD = saved }()
+	for iter := 0; iter < 500; iter++ {
+		var q [Dims]float64
+		for d := 0; d < Dims; d++ {
+			q[d] = rng.Float64()
+		}
+		q[9], q[10], q[11] = 0, 0, 0
+		q[5], q[6] = rng.Float64(), rng.Float64()
+		useSIMD = true
+		gotSIMD := ix.Score(q)
+		useSIMD = false
+		gotScalar := ix.Score(q)
+		if gotSIMD != gotScalar {
+			t.Fatalf("iter %d: SIMD Score=%v scalar Score=%v", iter, gotSIMD, gotScalar)
+		}
+	}
+}
+
 func TestCentroidDistAVX2ZeroAlloc(t *testing.T) {
 	if !useSIMD {
 		t.Skip("AVX2 unavailable on this CPU")

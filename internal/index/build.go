@@ -168,7 +168,31 @@ func (b *Builder) Build() *Index {
 		}
 	}
 	ix.data = soa
+
+	// 6. Quantized SoA twin of the centroids for the int16 SIMD cell-selection scan.
+	ix.buildCentroidI16()
 	return ix
+}
+
+// buildCentroidI16 fills centroidsI16 from the float64 centroids: per bucket, store
+// the quantized centroid codes dim-major (centroidsI16[b*Dims*nlist + d*nlist + c])
+// so distSoAi16AVX2 can load 8 cells of one dim per m128. Derived (not serialized),
+// so it runs both after Build and after a deserialize load. quantize() reuses the
+// row quantization (value space → native grid; mean -1 of a null dim → 0 sentinel),
+// keeping centroid codes on the same grid as the stored row codes.
+func (ix *Index) buildCentroidI16() {
+	nlist := ix.nlist
+	ix.centroidsI16 = make([]uint16, numBuckets*nlist*Dims+simdTailPad)
+	for b := 0; b < numBuckets; b++ {
+		bBlock := b * Dims * nlist
+		cbase := b * nlist
+		for c := 0; c < nlist; c++ {
+			off := (cbase + c) * Dims
+			for d := 0; d < Dims; d++ {
+				ix.centroidsI16[bBlock+d*nlist+c] = quantize(ix.centroids[off+d])
+			}
+		}
+	}
 }
 
 // kmeans runs Lloyd's algorithm over a bucket's rows in the dequantized value

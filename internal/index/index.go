@@ -44,7 +44,7 @@ const numBuckets = 16
 
 // maxProbe caps nprobe so the per-query probe buffer lives on the stack
 // (zero-allocation Score). nprobe is clamped to this.
-const maxProbe = 64
+const maxProbe = 1024
 
 // simdTailPad is the number of zero uint16 appended after the SoA data array so
 // the int16 SIMD kernel's last 8-row m128 load can never read past the slice.
@@ -162,7 +162,16 @@ type Index struct {
 	n         int
 	nlist     int       // k-means cells per bucket
 	centroids []float64 // numBuckets*nlist*Dims, in the dequantized value space
-	cellStart []int32   // CSR: rows of global cell i = [cellStart[i], cellStart[i+1]); len numBuckets*nlist+1
+	// centroidsI16 is the quantized SoA (dim-major per bucket) twin of centroids,
+	// derived (never serialized): centroidsI16[b*Dims*nlist + d*nlist + c] =
+	// quantize(centroids[(b*nlist+c)*Dims+d]). The int16 SIMD kernel (distSoAi16AVX2)
+	// scans the nlist centroids 8 at a time to pick the nprobe cells — replacing the
+	// scalar O(nlist) float64 centroid scan that dominated per-query CPU (the p99
+	// driver). Cell SELECTION only needs ordering, so the integer (query-quantized)
+	// distance is enough: exactness still comes from the float64 refine of candidates.
+	// +simdTailPad zero tail so the kernel's last 8-cell load can't read past the slice.
+	centroidsI16 []uint16
+	cellStart    []int32 // CSR: rows of global cell i = [cellStart[i], cellStart[i+1]); len numBuckets*nlist+1
 
 	bucketStart [17]int32 // rows of bucket b = [bucketStart[b], bucketStart[b+1])
 
@@ -299,6 +308,37 @@ func (ix *Index) centroidDist(q *[Dims]float64, cell int) float64 {
 	return d
 }
 
+// centroidIntDist is the integer squared distance Σ (qcode[d]-ccode[d])² from the
+// quantized query to centroid `local` (bucket-local index) of bucket block `bBlock`
+// in the SoA int16 centroid array. The int16 twin of centroidDist, used to pick the
+// nprobe cells; it is the scalar tail / fallback for distSoAi16AVX2 (same value).
+func (ix *Index) centroidIntDist(qcode *[Dims]int32, bBlock, nlist, local int) int32 {
+	cc := ix.centroidsI16
+	var d int32
+	for i := 0; i < Dims; i++ {
+		diff := qcode[i] - int32(cc[bBlock+i*nlist+local])
+		d += diff * diff
+	}
+	return d
+}
+
+// insertProbe inserts (d, cell) into the ascending-sorted top-np probe buffers
+// (pd distances, pc cell ids) if it beats the current np-th. Strict `<` (first-seen
+// wins ties) keeps cell selection deterministic, matching the old float path.
+func insertProbe(pd *[maxProbe]int32, pc *[maxProbe]int32, np int, d, cell int32) {
+	if d >= pd[np-1] {
+		return
+	}
+	pos := np - 1
+	for pos > 0 && pd[pos-1] > d {
+		pd[pos] = pd[pos-1]
+		pc[pos] = pc[pos-1]
+		pos--
+	}
+	pd[pos] = d
+	pc[pos] = cell
+}
+
 // Score returns the fraud fraction among the (approximately) K nearest reference
 // vectors.
 func (ix *Index) Score(query [Dims]float64) float64 {
@@ -382,10 +422,11 @@ func (ix *Index) searchTopK(q *[Dims]float64) (topK, int) {
 // only the nlist centroids (contiguous); the chosen cells are contiguous row
 // runs, so the candidate scan is prefetch-friendly.
 func (ix *Index) probeBucket(q *[Dims]float64, qcode *[Dims]int32, b int, col *intTopK, scanned *int) {
-	base := b * ix.nlist
+	nlist := ix.nlist
+	base := b * nlist
 	np := ix.nprobe
-	if np > ix.nlist {
-		np = ix.nlist
+	if np > nlist {
+		np = nlist
 	}
 	if np > maxProbe {
 		np = maxProbe
@@ -394,32 +435,46 @@ func (ix *Index) probeBucket(q *[Dims]float64, qcode *[Dims]int32, b int, col *i
 		np = 1
 	}
 
-	// Select the np nearest centroids into stack arrays (no allocation).
-	var pd [maxProbe]float64
+	// Select the np nearest centroids by INTEGER (query-quantized) distance into stack
+	// arrays (no allocation). The int16 SIMD kernel scans the nlist centroids 8 at a
+	// time (SoA dim-major per bucket); the <8 tail (and the whole scan when !useSIMD)
+	// uses the scalar centroidIntDist twin. Cell selection only needs ordering, so the
+	// integer distance suffices — the exact 5-NN still comes from the float64 refine.
+	var pd [maxProbe]int32
 	var pc [maxProbe]int32
 	for i := 0; i < np; i++ {
-		pd[i] = math.MaxFloat64
+		pd[i] = math.MaxInt32
 	}
-	for c := 0; c < ix.nlist; c++ {
-		d := ix.centroidDist(q, base+c)
-		if d >= pd[np-1] {
-			continue
+	bBlock := b * Dims * nlist // start of bucket b's SoA centroid block
+	var cbuf [simdChunk]int32
+	done := 0
+	for done < nlist {
+		c := nlist - done
+		if c > simdChunk {
+			c = simdChunk
 		}
-		pos := np - 1
-		for pos > 0 && pd[pos-1] > d {
-			pd[pos] = pd[pos-1]
-			pc[pos] = pc[pos-1]
-			pos--
+		nb := 0
+		if useSIMD {
+			nb = c / 8 // full 8-centroid blocks computed by the kernel
+			if nb > 0 {
+				distSoAi16AVX2(&qcode[0], &ix.centroidsI16[bBlock+done], nlist, nb, &cbuf[0])
+				for i := 0; i < nb*8; i++ {
+					insertProbe(&pd, &pc, np, cbuf[i], int32(base+done+i))
+				}
+			}
 		}
-		pd[pos] = d
-		pc[pos] = int32(base + c)
+		// Tail centroids (and the whole scan when !useSIMD): scalar int distance.
+		for i := nb * 8; i < c; i++ {
+			insertProbe(&pd, &pc, np, ix.centroidIntDist(qcode, bBlock, nlist, done+i), int32(base+done+i))
+		}
+		done += c
 	}
 
 	bLo := int(ix.bucketStart[b])
 	bRows := int(ix.bucketStart[b+1]) - bLo
 	sBase := bLo * Dims
 	for i := 0; i < np; i++ {
-		if pd[i] == math.MaxFloat64 {
+		if pd[i] == math.MaxInt32 {
 			break // fewer non-empty candidates than np
 		}
 		cell := int(pc[i])
